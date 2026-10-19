@@ -110,6 +110,43 @@ Factory reset: UI button, or `factory-reset.txt` on the boot partition.
 - Signed updates; security updates automatic by default.
 - Known limit: no secure boot on the Zero 2, so a physical attacker can change the SD card.
 
+## The app: kid-phone-server
+
+Decided 2026-10-19. The box runs https://github.com/siesta5787/kid-phone-server
+(static musl Rust, listens on 127.0.0.1:3100, keeps state in `data/`).
+
+- **Access: Tailscale HTTPS only.** `tailscale serve` → agent (a second, tailnet-only
+  listener) → app, with `X-Forwarded-Proto: https`, so the app's Secure cookies
+  work. The home LAN (port 80) only gets the box's own `/_system/` pages; app
+  paths there point people at the tailnet address.
+- **Releases: pinned by the box manifest.** This repo's signed `manifest.json`
+  names the exact app tarball (GitHub release asset) and its SHA-256; the box
+  installs nothing else. Publishing a new box manifest is what rolls out an app
+  version. The app's own release CI is unchanged.
+- **Layout on /data:** `app/releases/<v>/` (binary + `static/`), `app/current` →
+  active release, `app/state/` (the app's `data/`: SQLite DB, backups...),
+  `app/run/` working dir with `data` → `../state` and `static` → `../current/static`,
+  `app/env` (DATABASE_URL, BIND_ADDR, first-run ADMIN_*). Runs as user `app`,
+  sandboxed, writable only `app/state`.
+- **Updates with rollback:** stop app → snapshot the DB → switch `current` → start →
+  healthy (HTTP answer, not 5xx, within 60 s) or restore the snapshot and switch
+  back. The snapshot matters: an older binary can't open a DB a newer one migrated.
+- **Box API for the app:** a Unix socket only the `app` user can open
+  (`/run/box/api.sock`, env `BOX_API_SOCKET`). `GET /v1/status` (OS/app/Tailscale:
+  running, latest, update available, progress; restart needed), `POST /v1/check`,
+  `/v1/os/install`, `/v1/app/update`, `/v1/tailscale/update`, `/v1/reboot`. The app
+  replaces its apt/flag-file update code with these calls when `BOX_API_SOCKET` is
+  set. Suggested app tweaks: use the API on the Software updates page, add
+  `GET /healthz`.
+
+## Release manifest
+
+`manifest.json` (+ `manifest.json.sig`: Ed25519 over the file's bytes, key pinned
+in the OS image) published as assets of the latest GitHub release of this repo:
+`https://github.com/siesta5787/pi2zeroserver/releases/latest/download/manifest.json`.
+Lists the OS bundle (URL, version; RAUC checks its own signature) and the app
+tarball (URL, version, SHA-256). The agent checks it at boot and every ~12 h.
+
 ## Repo layout
 
 Buildroot can't build in a path with spaces, so this project folder holds the
