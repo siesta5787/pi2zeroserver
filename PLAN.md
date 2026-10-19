@@ -174,9 +174,15 @@ RPi Server DIstro/          (this folder, git)
      the work) and follows its progress; status page shows progress (self-
      refreshing, no JS), "installed — Restart now", or the error. Sources:
      http(s) URLs or *.raucb files under /data.
+   - ✅ 5e: Tailscale updates from the agent: latest version from
+     pkgs.tailscale.com, signing keys checked against pinned root keys,
+     streamed download hashed and signature-checked, only the two binaries
+     unpacked, then tailscale-activate. HTTPS via the system libcurl (the build
+     fails if the agent doesn't link it) with ca-certificates. Verified against
+     Tailscale's real key chain in tests; QEMU checks it runs and fails cleanly
+     offline. Still to verify on the Pi with internet.
    - 5c: signed update manifest + "update available" (needs: where releases
-     are hosted); 5e: Tailscale download + distsign verify + activate;
-     5f: app releases with activate/rollback
+     are hosted); 5f: app releases with activate/rollback
 6. Onboarding: AP, captive portal, Tailscale QR.
 7. Hardening: firewall, sandboxing, release defconfig (no curl CLI, no HDMI
    console login, release signing key).

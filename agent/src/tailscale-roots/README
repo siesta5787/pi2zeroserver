@@ -1,0 +1,4 @@
+Tailscale's distsign root public keys, copied from
+https://github.com/tailscale/tailscale/tree/main/clientupdate/distsign/roots
+(2026-10-19). They sign https://pkgs.tailscale.com/distsign.pub, the list of
+keys that sign each package. If Tailscale adds a root, add it here.

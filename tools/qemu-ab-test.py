@@ -352,6 +352,26 @@ def check_agent(con, slot):
           str(status.get("tailscale")))
     rc, out = con.sh("wget -T 10 -O /dev/null http://127.0.0.1/ 2>&1", check=False)
     check("no app installed: friendly 502 page", "502" in out, out.splitlines()[-1] if out else "")
+    if slot == "A":
+        rc, _ = con.sh("test -s /etc/ssl/certs/ca-certificates.crt", check=False)
+        check("CA certificates installed for HTTPS", rc == 0)
+        # QEMU has no internet: the updater must run and fail cleanly, installing nothing
+        code, body = agent_api(con, "/_system/api/tailscale/update", cookie, "")
+        state = {}
+        for _ in range(30):
+            code, body = agent_api(con, "/_system/api/tailscale/update", cookie)
+            try:
+                state = json.loads(body.splitlines()[-1])
+            except (ValueError, IndexError):
+                state = {}
+            if state.get("state") not in ("checking", "downloading", "installing"):
+                break
+            time.sleep(5)
+        # ...and with a network error: "Unsupported protocol" would mean curl lacks HTTPS
+        error = state.get("error", "")
+        check("Tailscale updater fails cleanly offline",
+              state.get("state") == "failed" and "pkgs.tailscale.com" in error
+              and "Unsupported protocol" not in error, str(state))
 
 
 def check_tailscale(con):
@@ -459,4 +479,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException:
+        # Keep the card for inspection; other runs and probes overwrite sdcard.img
+        card = os.path.join(WORK, "sdcard.img")
+        if os.path.exists(card):
+            subprocess.run(["cp", "--sparse=always", card, os.path.join(WORK, "sdcard.failed.img")])
+            print(f"card kept at {os.path.join(WORK, 'sdcard.failed.img')}", flush=True)
+        raise

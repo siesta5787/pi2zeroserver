@@ -28,6 +28,8 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
   - `boot.cmd` → `./build.sh dev host-uboot-tools-rebuild` (boot.scr is compiled
     when host-uboot-tools builds, not on every build)
   - rootfs overlay, `post-build.sh`, `post-image.sh` → plain `./build.sh dev`
+  - changed a package's `_DEPENDENCIES` → `<pkg>-dirclean` (`-rebuild` doesn't
+    refresh its per-package sysroot, so new libraries stay invisible)
   - `agent/` sources → `./build.sh dev box-agent-rebuild` (local package; Buildroot
     re-copies it only on rebuild). Run `cargo test` in `agent/` first: the agent
     targets Rust 1.88 (Buildroot's), so keep `rust-version` and let Cargo pick

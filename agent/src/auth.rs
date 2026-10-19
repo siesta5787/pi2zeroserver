@@ -35,6 +35,9 @@ pub const MIN_PASSWORD_LEN: usize = 8;
 
 pub struct Auth {
     password_file: PathBuf,
+    /// First-time setup is only offered while this is mounted, so a slow or
+    /// failed /data never looks like a brand-new box (None in tests)
+    storage: Option<PathBuf>,
     sessions: Mutex<HashMap<String, Instant>>,
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
@@ -67,9 +70,10 @@ fn hash_password(password: &str) -> String {
 }
 
 impl Auth {
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn new(data_dir: PathBuf, storage: Option<PathBuf>) -> Self {
         Self {
             password_file: data_dir.join("admin-password"),
+            storage,
             sessions: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
         }
@@ -77,6 +81,11 @@ impl Auth {
 
     pub fn has_password(&self) -> bool {
         self.password_file.exists()
+    }
+
+    /// False while the storage holding the password isn't mounted
+    pub fn storage_ready(&self) -> bool {
+        self.storage.as_deref().is_none_or(crate::status::is_mounted)
     }
 
     /// Replaces the password and logs out every session.
@@ -204,6 +213,11 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     let deny = |status: StatusCode, page: &'static str| {
         if is_api { status.into_response() } else { Redirect::to(page).into_response() }
     };
+    if !state.auth.storage_ready() && path != "/_system/api/health" {
+        let page =
+            crate::pages::message("Starting up", "The box's storage isn't ready yet. Try again in a minute.");
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::response::Html(page)).into_response();
+    }
     if !state.auth.has_password() {
         // First run: choosing a password is the only thing to do
         return if matches!(path.as_str(), "/_system" | "/_system/password" | "/_system/api/health") {
@@ -235,6 +249,15 @@ mod tests {
     }
 
     #[test]
+    fn no_setup_while_storage_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // A plain directory on / stands in for /data that isn't mounted
+        let auth = Auth::new(dir.path().to_owned(), Some(dir.path().to_owned()));
+        assert!(!auth.storage_ready());
+        assert!(Auth::new(dir.path().to_owned(), Some("/proc".into())).storage_ready());
+    }
+
+    #[test]
     fn origin_check() {
         assert!(same_origin(&headers(&[("host", "box.local"), ("origin", "http://box.local")])));
         assert!(same_origin(&headers(&[("host", "box.local"), ("referer", "http://box.local/_system/")])));
@@ -256,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn password_and_lockout() {
         let dir = tempfile::tempdir().unwrap();
-        let auth = Auth::new(dir.path().to_owned());
+        let auth = Auth::new(dir.path().to_owned(), None);
         assert!(!auth.has_password());
         auth.set_password("correct horse".into()).await.unwrap();
         let ip: IpAddr = "192.168.0.9".parse().unwrap();

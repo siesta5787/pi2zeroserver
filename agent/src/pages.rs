@@ -4,6 +4,7 @@ use std::fmt::Write;
 
 use crate::os_update::Install;
 use crate::status::Status;
+use crate::tailscale_update::Update;
 
 /// Escapes text for HTML element content and attribute values.
 pub fn esc(s: &str) -> String {
@@ -87,7 +88,29 @@ fn update_section(install: &Install) -> String {
     format!("<section><h2>Updates</h2>{body}{advanced}</section>")
 }
 
-pub fn status(s: &Status, install: &Install) -> String {
+fn tailscale_update_line(update: &Update) -> String {
+    let button = "<form method=\"post\" action=\"/_system/tailscale/update\">\
+                  <button>Check for a Tailscale update</button></form>";
+    match update {
+        Update::Idle => button.to_owned(),
+        Update::Checking => "<p class=\"muted\">Checking for a newer version…</p>".to_owned(),
+        Update::Downloading { version, percent } => {
+            format!("<p class=\"warn\">Downloading Tailscale {}: {percent}%</p>", esc(version))
+        }
+        Update::Installing { version } => {
+            format!("<p class=\"warn\">Installing Tailscale {}…</p>", esc(version))
+        }
+        Update::Updated { version } => format!("<p class=\"ok\">Updated to Tailscale {}.</p>", esc(version)),
+        Update::UpToDate { version } => {
+            format!("<p class=\"ok\">Tailscale {} is the latest version.</p>{button}", esc(version))
+        }
+        Update::Failed { error } => {
+            format!("<p class=\"warn\">Tailscale wasn't updated: {}</p>{button}", esc(error))
+        }
+    }
+}
+
+pub fn status(s: &Status, install: &Install, ts_update: &Update) -> String {
     let mut b = String::from("<h1>Box</h1>");
 
     // System
@@ -121,8 +144,9 @@ pub fn status(s: &Status, install: &Install) -> String {
     let _ = write!(
         b,
         "<section><h2>Remote access (Tailscale)</h2><p class=\"{class}\">{line}</p>\
-         <p class=\"muted\">Version {}</p></section>",
+         <p class=\"muted\">Version {}</p>{}</section>",
         esc(ts.version.as_deref().unwrap_or("unknown")),
+        tailscale_update_line(ts_update),
     );
 
     // Storage
@@ -138,7 +162,9 @@ pub fn status(s: &Status, install: &Install) -> String {
          <a href=\"/_system/password\">Change password</a></p>\
          <form method=\"post\" action=\"/_system/logout\"><button>Sign out</button></form>",
     );
-    let refresh = matches!(install, Install::Running { .. }).then_some((3, "/_system/"));
+    let busy = matches!(install, Install::Running { .. })
+        || matches!(ts_update, Update::Checking | Update::Downloading { .. } | Update::Installing { .. });
+    let refresh = busy.then_some((3, "/_system/"));
     page_refreshing("Box", &b, refresh)
 }
 
@@ -241,7 +267,7 @@ mod tests {
             data: Some(Disk { total_bytes: 30_000_000_000, free_bytes: 29_500_000_000 }),
             uptime_seconds: 3 * 3600 + 5 * 60,
         };
-        let html = status(&s, &Install::Idle);
+        let html = status(&s, &Install::Idle, &Update::Idle);
         assert!(!html.contains("<script>") && html.contains("&lt;script&gt;"));
         assert!(html.contains("evil&lt;b&gt;"));
         assert!(html.contains("A backup copy of the system is ready"));

@@ -2,6 +2,9 @@
 Description=Box agent: system pages, app proxy and updates
 Wants=network.target
 After=network.target tailscaled.service
+# The admin password lives on /data; without it the agent would offer
+# first-time setup to anyone (e.g. while /data is still being checked after a power cut)
+RequiresMountsFor=/data
 
 [Service]
 ExecStart=/usr/bin/box-agent

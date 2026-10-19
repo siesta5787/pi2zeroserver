@@ -119,21 +119,24 @@ fn parse_tailscale(v: &Value) -> Tailscale {
     }
 }
 
+/// True if `path` is a mount point of its own, not just a directory on /
+pub fn is_mounted(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(path), std::fs::metadata("/")) {
+        (Ok(a), Ok(b)) => a.dev() != b.dev(),
+        _ => false,
+    }
+}
+
 fn disk_usage(path: &str) -> Option<Disk> {
+    // Only report /data itself, not the directory under it when it isn't mounted
+    if !is_mounted(path.as_ref()) {
+        return None;
+    }
     let c_path = std::ffi::CString::new(path).ok()?;
     // SAFETY: c_path is a valid C string; st is written by statvfs before use.
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    // Only report /data itself, not the directory under it when it isn't mounted
-    let parent = std::ffi::CString::new("/").ok()?;
-    let (mut a, mut b): (libc::stat, libc::stat) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
-    // SAFETY: as above
-    if unsafe { libc::stat(c_path.as_ptr(), &mut a) != 0 || libc::stat(parent.as_ptr(), &mut b) != 0 } {
-        return None;
-    }
-    if a.st_dev == b.st_dev {
         return None;
     }
     let frsize = st.f_frsize as u64;

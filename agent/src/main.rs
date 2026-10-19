@@ -13,6 +13,7 @@ mod os_update;
 mod pages;
 mod proxy;
 mod status;
+mod tailscale_update;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -30,6 +31,7 @@ struct AppState {
     proxy: proxy::Proxy,
     auth: Arc<auth::Auth>,
     os_update: os_update::OsUpdate,
+    tailscale_update: tailscale_update::TailscaleUpdate,
     /// Command that restarts the box (replaced in tests)
     reboot: Arc<Vec<String>>,
 }
@@ -38,8 +40,13 @@ impl AppState {
     fn new(app: SocketAddr, data_dir: PathBuf) -> Self {
         Self {
             proxy: proxy::Proxy::new(app),
-            auth: Arc::new(auth::Auth::new(data_dir)),
+            // On the device the data dir lives on the /data partition
+            auth: Arc::new(auth::Auth::new(
+                data_dir.clone(),
+                data_dir.starts_with("/data").then(|| PathBuf::from("/data")),
+            )),
             os_update: os_update::OsUpdate::new("rauc".into()),
+            tailscale_update: tailscale_update::TailscaleUpdate::new(tailscale_update::Config::device()),
             reboot: Arc::new(vec!["systemctl".into(), "reboot".into()]),
         }
     }
@@ -85,6 +92,8 @@ fn router(state: AppState) -> Router {
         .route("/_system/api/os/install", get(os_install_state).post(os_install_api))
         .route("/_system/os/install", post(os_install_form))
         .route("/_system/restart", post(restart))
+        .route("/_system/api/tailscale/update", get(tailscale_update_state).post(tailscale_update_api))
+        .route("/_system/tailscale/update", post(tailscale_update_form))
         // Unknown system paths stay with the agent rather than reaching the app
         .route("/_system/{*rest}", any(|| async { StatusCode::NOT_FOUND }))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard));
@@ -92,7 +101,7 @@ fn router(state: AppState) -> Router {
 }
 
 async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
-    Html(pages::status(&status::gather().await, &state.os_update.state()))
+    Html(pages::status(&status::gather().await, &state.os_update.state(), &state.tailscale_update.state()))
 }
 
 async fn status_json() -> impl IntoResponse {
@@ -130,6 +139,21 @@ async fn os_install_form(State(state): State<AppState>, Form(form): Form<Install
         )
             .into_response(),
     }
+}
+
+async fn tailscale_update_state(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.tailscale_update.state())
+}
+
+/// Checks for and installs a newer Tailscale; 202, or 409 if already running
+async fn tailscale_update_api(State(state): State<AppState>) -> Response {
+    let status = if state.tailscale_update.start() { StatusCode::ACCEPTED } else { StatusCode::CONFLICT };
+    (status, axum::Json(state.tailscale_update.state())).into_response()
+}
+
+async fn tailscale_update_form(State(state): State<AppState>) -> Redirect {
+    state.tailscale_update.start();
+    Redirect::to("/_system/")
 }
 
 /// Restarts the box shortly after answering, so the page still arrives.
