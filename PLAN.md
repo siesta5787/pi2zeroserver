@@ -166,11 +166,14 @@ RPi Server DIstro/          (this folder, git)
      port 80, `/_system/` status page + `/_system/api/{health,status}`, reverse
      proxy to 127.0.0.1:8080 with a friendly page when the app is down, boot
      health check. 1.3 MB binary.
-   - 5b: signed update manifest + "update available" (needs: where releases
-     are hosted)
-   - 5c: OS install via RAUC D-Bus with progress; 5d: Tailscale download +
-     distsign verify + activate; 5e: app releases with activate/rollback;
-     5f: admin password, sessions, CSRF
+   - ✅ 5b: admin password (Argon2id in /data/agent), sessions in an HttpOnly
+     SameSite=Strict cookie, per-address lockout, Origin check on posts. Only
+     /_system/api/health is public; localhost gets no special trust (tailscale
+     serve forwards from 127.0.0.1).
+   - 5c: signed update manifest + "update available" (needs: where releases
+     are hosted); 5d: OS install via RAUC D-Bus with progress; 5e: Tailscale
+     download + distsign verify + activate; 5f: app releases with activate/rollback
 6. Onboarding: AP, captive portal, Tailscale QR.
-7. Hardening: firewall, sandboxing, release defconfig without SSH.
+7. Hardening: firewall, sandboxing, release defconfig (no curl CLI, no HDMI
+   console login, release signing key).
 8. Releases: CI pipeline, signed manifest, Imager repo, novice guide.

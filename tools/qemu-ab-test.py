@@ -288,10 +288,33 @@ def stage_release(con, version, broken_daemon=False):
            f"&& echo {version} > {rel}/VERSION && sync", timeout=600)
 
 
+ADMIN_PASSWORD = "qemu+test+password"  # form-encoded
+
+
+def agent_post(con, path, form):
+    """POST a form like the box's own page would; returns the session cookie set.
+    (curl, not BusyBox wget: wget re-POSTs on redirects and hides Set-Cookie.)"""
+    out = con.sh(f"curl -s -m 30 -o /dev/null -D - -H 'Origin: http://127.0.0.1' "
+                 f"-d '{form}' http://127.0.0.1{path}", timeout=60, check=False)[1]
+    m = re.search(r"set-cookie: (box_session=[0-9a-f]+)", out, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
 def check_agent(con, slot):
     rc, out = con.sh("wget -q -T 10 -O - http://127.0.0.1/_system/api/health", check=False)
     check(f"agent answers on slot {slot}", rc == 0 and out.splitlines()[-1:] == ["ok"], out)
-    rc, out = con.sh("wget -q -T 30 -O - http://127.0.0.1/_system/api/status", timeout=60, check=False)
+    rc, out = con.sh("wget -T 10 -O /dev/null http://127.0.0.1/_system/api/status 2>&1", check=False)
+    check(f"status API needs a login on slot {slot}", "401" in out, out.splitlines()[-1] if out else "")
+    if slot == "A":
+        cookie = agent_post(con, "/_system/password", f"password={ADMIN_PASSWORD}&confirm={ADMIN_PASSWORD}")
+        check("first visit sets the admin password", bool(cookie))
+        rc, out = con.sh("ls -l /data/agent/admin-password | cut -c1-10", check=False)
+        check("admin password stored privately", out.splitlines()[-1:] == ["-rw-------"], out)
+    else:
+        cookie = agent_post(con, "/_system/login", f"password={ADMIN_PASSWORD}")
+        check("admin password survives the OS update", bool(cookie))
+    rc, out = con.sh(f"curl -s -m 30 -H 'Cookie: {cookie}' http://127.0.0.1/_system/api/status",
+                     timeout=60, check=False)
     try:
         status = json.loads(out.splitlines()[-1])
     except (ValueError, IndexError):

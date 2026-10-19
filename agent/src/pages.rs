@@ -93,8 +93,62 @@ pub fn status(s: &Status) -> String {
     };
     let _ = write!(b, "<section><h2>Storage</h2>{storage}</section>");
 
-    b.push_str("<p class=\"muted\"><a href=\"/\">Open the app</a></p>");
+    b.push_str(
+        "<p class=\"muted\"><a href=\"/\">Open the app</a> · \
+         <a href=\"/_system/password\">Change password</a></p>\
+         <form method=\"post\" action=\"/_system/logout\"><button>Sign out</button></form>",
+    );
     page("Box", &b)
+}
+
+fn error_line(error: Option<&str>) -> String {
+    error.map(|e| format!("<p class=\"warn\" role=\"alert\">{}</p>", esc(e))).unwrap_or_default()
+}
+
+pub fn login(error: Option<&str>) -> String {
+    page(
+        "Sign in",
+        &format!(
+            "<h1>Sign in to Box</h1>{}\
+             <form method=\"post\" action=\"/_system/login\">\
+             <p><label>Password<br><input type=\"password\" name=\"password\" \
+             autocomplete=\"current-password\" required autofocus></label></p>\
+             <p><button>Sign in</button></p></form>",
+            error_line(error)
+        ),
+    )
+}
+
+/// `first_run`: no password yet, so no "current password" field
+pub fn set_password(first_run: bool, error: Option<&str>) -> String {
+    let (title, intro, current) = if first_run {
+        (
+            "Choose a password",
+            "<p>Pick a password for this box. You'll need it to change settings and install updates.</p>",
+            "",
+        )
+    } else {
+        (
+            "Change password",
+            "",
+            "<p><label>Current password<br><input type=\"password\" name=\"current\" \
+             autocomplete=\"current-password\" required></label></p>",
+        )
+    };
+    page(
+        title,
+        &format!(
+            "<h1>{title}</h1>{intro}{}<form method=\"post\" action=\"/_system/password\">{current}\
+             <p><label>New password (at least {min} characters)<br>\
+             <input type=\"password\" name=\"password\" minlength=\"{min}\" \
+             autocomplete=\"new-password\" required></label></p>\
+             <p><label>New password again<br><input type=\"password\" name=\"confirm\" \
+             minlength=\"{min}\" autocomplete=\"new-password\" required></label></p>\
+             <p><button>Save password</button></p></form>",
+            error_line(error),
+            min = crate::auth::MIN_PASSWORD_LEN,
+        ),
+    )
 }
 
 pub fn app_down() -> String {
