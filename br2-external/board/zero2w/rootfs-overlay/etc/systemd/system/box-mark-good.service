@@ -1,0 +1,16 @@
+# Tells U-Boot this slot works, which stops the rollback countdown.
+# Health checks hook in with Before=/RequiredBy=boot-complete.target; if any
+# fails, this doesn't run and repeated failed boots roll back to the other slot.
+[Unit]
+Description=Mark the booted A/B slot as good
+ConditionKernelCommandLine=rauc.slot
+Requires=boot-complete.target
+After=boot-complete.target multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/rauc status mark-good
+
+[Install]
+WantedBy=multi-user.target

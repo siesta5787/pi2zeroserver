@@ -2,3 +2,5 @@
 /local/*
 !/local/README
 !/local/wifi.env.example
+
+__pycache__/

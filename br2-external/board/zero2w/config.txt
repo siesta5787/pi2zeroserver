@@ -1,6 +1,7 @@
 # Box appliance - Raspberry Pi Zero 2 W (headless)
 arm_64bit=1
-kernel=Image
+# U-Boot picks the A/B slot and loads the kernel from it
+kernel=u-boot.bin
 
 # Headless: cut-down GPU firmware and the minimum GPU memory
 start_file=start_cd.elf

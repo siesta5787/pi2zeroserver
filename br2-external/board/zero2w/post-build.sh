@@ -9,9 +9,20 @@ SYSTEMCTL="${HOST_DIR}/bin/systemctl"
 
 "${SYSTEMCTL}" --root="${TARGET}" enable \
 	iwd.service systemd-networkd.service systemd-resolved.service \
-	systemd-timesyncd.service data.mount
+	systemd-timesyncd.service data.mount \
+	box-health-data.service box-mark-good.service
 
 install -d -m 0755 "${TARGET}/data"
+
+# RAUC only installs bundles signed by this certificate (set by build.sh)
+install -D -m 0644 "${BOX_RAUC_CERT}" "${TARGET}/etc/rauc/keyring.pem"
+
+echo "${BOX_VERSION}" > "${TARGET}/etc/box-version"
+
+# No RTC on the Pi: systemd never sets the clock earlier than this file's
+# mtime, so the clock starts at least at build time. Without this, a boot with
+# no network sits in the past and update signatures look "not yet valid".
+touch "${TARGET}/usr/lib/clock-epoch"
 
 [ "${VARIANT}" = dev ] || exit 0
 

@@ -137,9 +137,11 @@ RPi Server DIstro/          (this folder, git)
 
 ## Work order
 
-1. Boots on Wi-Fi: dev defconfig, systemd, iwd with hard-coded Wi-Fi, SSH.
-2. A/B: genimage, U-Boot bootcount script, RAUC, mark-good. Test rollback with a
-   deliberately broken bundle, and power loss mid-update.
+1. ✅ Boots on Wi-Fi: dev defconfig, systemd, iwd. (SSH dropped; Wi-Fi for dev
+   cards via `local/wifi.env` or `sudo tools/set-wifi.sh <mounted rootfs>`.)
+2. ✅ A/B: genimage, U-Boot bootcount script, RAUC, mark-good. Passes
+   `tools/qemu-ab-test.py` (boot A → install to B → forced rollback to A).
+   Still to do on real hardware: power loss mid-update.
 3. `/data`: grows on first boot, persistent `/etc` bits, read-only rootfs.
 4. Tailscale: rootfs copy, state on `/data`, swap/rollback updater.
 5. Agent: proxy, status, manifest, OS/app/Tailscale update flows.

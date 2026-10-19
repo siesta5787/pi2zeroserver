@@ -1,0 +1,38 @@
+From: Box build <noreply@users.noreply.github.com>
+Subject: [PATCH] serial: support Raspberry Pi kernel PL011 console
+
+Raspberry Pi kernel device trees (6.12) give the BCM283x PL011 the
+compatible "arm,pl011-axi" only. With the firmware passing that device
+tree (OF_BOARD) and disable-bt making the PL011 serial0/stdout, no
+driver matched the console node.
+
+lists_bind_fdt() then returns 0 with *devp = NULL, and
+serial_check_stdout() passed that NULL to device_get_uclass_id(),
+crashing U-Boot before any output.
+
+Match "arm,pl011-axi" in the BCM283x PL011 driver (same registers;
+U-Boot already uses 32-bit accesses), and don't dereference a NULL
+device when the stdout node has no driver.
+
+--- a/drivers/serial/serial_bcm283x_pl011.c	2026-10-18 22:42:29.411357632 -0400
++++ b/drivers/serial/serial_bcm283x_pl011.c	2026-10-18 22:42:29.446647913 -0400
+@@ -83,6 +83,8 @@
+ 
+ static const struct udevice_id bcm283x_pl011_serial_id[] = {
+ 	{.compatible = "brcm,bcm2835-pl011", .data = TYPE_PL011},
++	/* Raspberry Pi kernel device trees name the BCM283x PL011 like this */
++	{.compatible = "arm,pl011-axi", .data = TYPE_PL011},
+ 	{}
+ };
+ 
+--- a/drivers/serial/serial-uclass.c	2026-10-18 22:42:29.417398644 -0400
++++ b/drivers/serial/serial-uclass.c	2026-10-18 22:42:29.446938175 -0400
+@@ -62,7 +62,7 @@
+ 	 * anyway.
+ 	 */
+ 	if (node > 0 && !lists_bind_fdt(gd->dm_root, offset_to_ofnode(node),
+-					devp, NULL, false)) {
++					devp, NULL, false) && *devp) {
+ 		if (device_get_uclass_id(*devp) == UCLASS_SERIAL &&
+ 		    !device_probe(*devp))
+ 			return 0;

@@ -1,0 +1,20 @@
+# Redundant environment in the raw gap before p1 (see genimage.cfg and
+# /etc/fw_env.config, which must match)
+# CONFIG_ENV_IS_IN_FAT is not set
+# (post-image.sh fails the build if these don't all make it into .config)
+CONFIG_ENV_IS_IN_MMC=y
+CONFIG_ENV_REDUNDANT=y
+CONFIG_ENV_SIZE=0x4000
+CONFIG_ENV_OFFSET=0x400000
+CONFIG_ENV_OFFSET_REDUND=0x410000
+CONFIG_ENV_MMC_DEVICE_INDEX=0
+CONFIG_ENV_MMC_EMMC_HW_PARTITION=0
+# Boot straight into the A/B script on the FAT partition. Nothing else:
+# no EFI, no USB or network boot, no USB keyboard.
+CONFIG_BOOTDELAY=0
+CONFIG_USE_BOOTCOMMAND=y
+CONFIG_BOOTCOMMAND="load mmc 0:1 ${scriptaddr} boot.scr && source ${scriptaddr}"
+# CONFIG_USE_PREBOOT is not set
+# CONFIG_EFI_LOADER is not set
+# CONFIG_USB_KEYBOARD is not set
+CONFIG_CMD_SETEXPR=y

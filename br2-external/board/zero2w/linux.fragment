@@ -5,3 +5,14 @@ CONFIG_WATCHDOG=y
 CONFIG_BCM2835_WDT=y
 # No Bluetooth on this appliance
 # CONFIG_BT is not set
+# RAUC bundles: squashfs + dm-verity over loop, streaming over NBD
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_XZ=y
+CONFIG_BLK_DEV_LOOP=y
+CONFIG_MD=y
+CONFIG_BLK_DEV_DM=y
+CONFIG_DM_VERITY=y
+CONFIG_BLK_DEV_NBD=y
+# Modules are xz-compressed; let the kernel decompress them (kmod hands the
+# compressed file to finit_module). Without this no module loads, Wi-Fi included.
+CONFIG_MODULE_DECOMPRESS=y

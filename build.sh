@@ -50,6 +50,28 @@ export BR2_DL_DIR="${BUILD_ROOT}/cache/dl"
 export BR2_CCACHE_DIR="${BUILD_ROOT}/cache/ccache"
 export BOX_LOCAL_DIR="${PROJECT_DIR}/local"
 
+# Version stamped into /etc/box-version and the RAUC bundle. Sorts by build time.
+dirty="$(git -C "${PROJECT_DIR}" diff --quiet HEAD -- 2>/dev/null || echo -dirty)"
+export BOX_VERSION="${BOX_VERSION:-$(date -u +%Y.%m.%d.%H%M)-g$(git -C "${PROJECT_DIR}" rev-parse --short HEAD)${dirty}}"
+
+# RAUC signing key. Dev builds get a self-signed key generated on first use;
+# devices only accept bundles signed by the key their image was built with,
+# so keep local/rauc/ backed up or dev devices will need reflashing.
+if [ -z "${BOX_RAUC_KEY:-}" ]; then
+	BOX_RAUC_KEY="${PROJECT_DIR}/local/rauc/${VARIANT}-key.pem"
+	BOX_RAUC_CERT="${PROJECT_DIR}/local/rauc/${VARIANT}-cert.pem"
+	if [ ! -f "${BOX_RAUC_KEY}" ]; then
+		[ "${VARIANT}" = dev ] || {
+			echo "No release signing key: set BOX_RAUC_KEY and BOX_RAUC_CERT" >&2; exit 1; }
+		mkdir -p "${PROJECT_DIR}/local/rauc"
+		openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+			-days 36500 -subj "/O=Box/CN=Box ${VARIANT} update signing" \
+			-keyout "${BOX_RAUC_KEY}" -out "${BOX_RAUC_CERT}"
+		chmod 0600 "${BOX_RAUC_KEY}"
+	fi
+fi
+export BOX_RAUC_KEY BOX_RAUC_CERT="${BOX_RAUC_CERT:?set BOX_RAUC_CERT with BOX_RAUC_KEY}"
+
 OUT="${BUILD_ROOT}/output/${VARIANT}"
 MAKE=(make -C "${BUILD_ROOT}/buildroot" O="${OUT}" BR2_EXTERNAL="${BUILD_ROOT}/br2-external")
 
