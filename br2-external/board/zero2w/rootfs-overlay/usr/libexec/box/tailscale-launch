@@ -1,0 +1,7 @@
+#!/bin/sh
+# Run tailscale or tailscaled from the active release (see tailscale-lib.sh).
+set -eu
+. /usr/libexec/box/tailscale-lib.sh
+prog="$1"
+shift
+exec "$(ts_active_dir)/${prog}" "$@"

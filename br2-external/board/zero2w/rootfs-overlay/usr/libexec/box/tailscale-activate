@@ -1,0 +1,56 @@
+#!/bin/sh
+# Usage: tailscale-activate VERSION
+#
+# Switch Tailscale to /data/tailscale/releases/VERSION (tailscale, tailscaled
+# and a VERSION file, already downloaded and verified), restart it, and check
+# the daemon comes back running that release. If it doesn't within 90 s,
+# switch back to whatever ran before and restart that.
+#
+# Exit status: 0 activated, 1 failed and rolled back, 2 release not usable.
+set -eu
+. /usr/libexec/box/tailscale-lib.sh
+
+ver="${1:?usage: tailscale-activate VERSION}"
+rel="${TS_RELEASES}/${ver}"
+
+if ! ts_complete "${rel}" || [ "$(cat "${rel}/VERSION")" != "${ver}" ]; then
+	echo "${rel} is not a complete Tailscale ${ver} release" >&2
+	exit 2
+fi
+if ! ts_newer "${ver}" "$(cat "${TS_BUILTIN}/VERSION")"; then
+	echo "Tailscale ${ver} is not newer than the built-in $(cat "${TS_BUILTIN}/VERSION")" >&2
+	exit 2
+fi
+# Catches a wrong-architecture or truncated download before touching anything
+if ! want="$("${rel}/tailscale" version 2>/dev/null | head -n 1)" || [ -z "${want}" ]; then
+	echo "${rel}/tailscale doesn't run" >&2
+	exit 2
+fi
+
+prev="$(readlink "${TS_CURRENT}" 2>/dev/null || true)"
+ln -sfn "releases/${ver}" "${TS_CURRENT}"
+sync
+systemctl restart tailscaled || true
+
+if ts_wait_daemon "${want}" 90; then
+	# Keep this release and the one before it; drop older ones
+	for d in "${TS_RELEASES}"/*; do
+		[ -e "${d}" ] || continue
+		case "$(basename "${d}")" in
+		"${ver}" | "$(basename "${prev:-none}")") ;;
+		*) rm -rf "${d}" ;;
+		esac
+	done
+	echo "Tailscale ${ver} active"
+	exit 0
+fi
+
+echo "Tailscale ${ver} didn't come up; switching back" >&2
+if [ -n "${prev}" ]; then
+	ln -sfn "${prev}" "${TS_CURRENT}"
+else
+	rm -f "${TS_CURRENT}"
+fi
+sync
+systemctl restart tailscaled || true
+exit 1

@@ -1,0 +1,3 @@
+# From https://pkgs.tailscale.com/stable/tailscale_1.104.1_arm64.tgz.sha256
+# (also checked against the tarball's distsign signature)
+sha256  f60294374967f3dfd8cf57bbbd474d6cfce32d123e3a8ddeab82a87940daa806  tailscale_1.104.1_arm64.tgz

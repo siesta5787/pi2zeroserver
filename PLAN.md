@@ -73,6 +73,16 @@ are baked into the read-only rootfs.
 | App | download → verify → switch `current` → restart | `/healthz` OK within 30 s | switch back |
 | Tailscale | official static arm64 tarball → verify → switch → restart | backend `Running` within 60 s | switch back, else rootfs copy |
 
+Tailscale tarball verification (worked out on 1.104.1): each
+`tailscale_<v>_arm64.tgz` has a `.sig` that is a raw Ed25519 signature over
+`BLAKE2s-256(file) || uint64_le(file length)`, by a key in
+`https://pkgs.tailscale.com/distsign.pub`. That key list is itself signed
+(`distsign.pub.sig`) by Tailscale's root keys, which the agent should pin.
+Latest version: `https://pkgs.tailscale.com/stable/?mode=json` →
+`TarballsVersion`. The agent unpacks a verified release to
+`/data/tailscale/releases/<v>/` and calls `/usr/libexec/box/tailscale-activate <v>`
+(exit 0 activated, 1 rolled back, 2 unusable).
+
 The device checks every ~12 h with jitter. By default OS and Tailscale updates
 install automatically overnight; app updates are notify-only. Downgrades need an
 explicit choice.
@@ -146,7 +156,11 @@ RPi Server DIstro/          (this folder, git)
 3. ✅ `/data`: grows on first boot, read-only rootfs, `/var` in RAM; Wi-Fi
    (iwd), RAUC status and timesyncd's clock persist on `/data` via bind mounts.
    QEMU test covers first-boot growth, a power cut, and `/data` shared by both slots.
-4. Tailscale: rootfs copy, state on `/data`, swap/rollback updater.
+4. ✅ Tailscale: official 1.104.1 static binaries built in, state on `/data`,
+   newer-wins launcher, `tailscale-activate` with health check and rollback,
+   and a boot health check so a broken Tailscale blocks marking an OS slot good.
+   QEMU test covers activate, broken-release rollback, and surviving an OS update.
+   Downloading/verifying releases is the agent's job (step 5).
 5. Agent: proxy, status, manifest, OS/app/Tailscale update flows.
 6. Onboarding: AP, captive portal, Tailscale QR.
 7. Hardening: firewall, sandboxing, release defconfig without SSH.

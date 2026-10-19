@@ -1,0 +1,2 @@
+# Applets the box helper scripts rely on, on top of Buildroot's default set
+CONFIG_TIMEOUT=y

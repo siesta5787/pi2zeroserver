@@ -7,6 +7,8 @@ Boots a copy of the dev sdcard.img and checks:
   2. after the power cut /data is intact; `rauc install` of a signed bundle
      switches to slot B, which boots, is marked good and sees the same /data
   3. a broken slot B (kernel removed) uses up its tries and rolls back to slot A
+Along the way: the built-in Tailscale runs, a newer release activates from
+/data (and survives the OS update), and a broken release rolls back.
 
 QEMU has no Raspberry Pi firmware and a few emulation gaps, so the test builds
 adapted copies of a few pieces. Everything else is the production build:
@@ -271,6 +273,46 @@ def check_slot_basics(con, slot):
     check(f"slot {slot} /var is a tmpfs", out.splitlines()[-1:] == ["tmpfs"], out)
 
 
+def tailscaled_exe(con):
+    out = con.sh("readlink /proc/$(pidof tailscaled)/exe", check=False)[1].splitlines()
+    return out[-1] if out else ""
+
+
+def stage_release(con, version, broken_daemon=False):
+    """Put a Tailscale release on /data the way the updater will: the built-in
+    binaries under a fake newer version number (QEMU has no network)."""
+    rel = f"/data/tailscale/releases/{version}"
+    daemon = (f"printf '#!/bin/sh\\nexit 1\\n' > {rel}/tailscaled && chmod 755 {rel}/tailscaled"
+              if broken_daemon else f"cp /usr/lib/box/tailscale/tailscaled {rel}/")
+    con.sh(f"mkdir -p {rel} && cp /usr/lib/box/tailscale/tailscale {rel}/ && {daemon} "
+           f"&& echo {version} > {rel}/VERSION && sync", timeout=600)
+
+
+def check_tailscale(con):
+    builtin = con.sh("cat /usr/lib/box/tailscale/VERSION")[1].splitlines()[-1]
+    rc, out = con.sh("systemctl is-active tailscaled", check=False)
+    check("tailscaled running", rc == 0, out.splitlines()[-1] if out else "")
+    rc, out = con.sh("/usr/libexec/box/tailscale-check 120 && . /usr/libexec/box/tailscale-lib.sh && ts_daemon_version",
+                     timeout=180, check=False)
+    check("tailscaled answers as the built-in version", rc == 0 and out.splitlines()[-1:] == [builtin], out)
+    state = con.sh("tailscale status --json | sed -n 's/.*\"BackendState\": *\"\\([A-Za-z]*\\)\".*/\\1/p'", check=False)[1]
+    check("Tailscale waiting for login", state.splitlines()[-1:] == ["NeedsLogin"], state)
+
+    stage_release(con, "9999.0.0")
+    rc, out = con.sh("/usr/libexec/box/tailscale-activate 9999.0.0", timeout=300, check=False)
+    check("newer Tailscale release activates", rc == 0, out.splitlines()[-1] if out else "")
+    check("tailscaled runs from the activated release",
+          "/data/tailscale/releases/9999.0.0/" in tailscaled_exe(con), tailscaled_exe(con))
+
+    stage_release(con, "9999.0.1", broken_daemon=True)
+    rc, out = con.sh("/usr/libexec/box/tailscale-activate 9999.0.1", timeout=400, check=False)
+    check("broken Tailscale release is rolled back", rc == 1, out.splitlines()[-1] if out else "")
+    link = con.sh("readlink /data/tailscale/current")[1].splitlines()[-1]
+    rc, _ = con.sh("/usr/libexec/box/tailscale-check 120", timeout=180, check=False)
+    check("previous Tailscale release running again",
+          link == "releases/9999.0.0" and rc == 0 and "/9999.0.0/" in tailscaled_exe(con), link)
+
+
 def main():
     # rauc runs mksquashfs etc. from the build's host tools
     os.environ["PATH"] = f"{HOST}/bin:{SBIN}:{os.environ['PATH']}"
@@ -303,6 +345,7 @@ def main():
         check("/data grown to fill the card", kb > 800_000, f"{kb // 1024} MiB")
         rc, out = con.sh("ls -ld /data/iwd /data/rauc | cut -c1-10", check=False)
         check("/data state folders created", rc == 0 and out.split() == ["drwx------"] * 2, out)
+        check_tailscale(con)
         con.sh("echo kept > /data/marker && sync")
     finally:
         con.stop()  # pull the power
@@ -327,6 +370,8 @@ def main():
         check("update boots slot B", booted_slot(con) == "B")
         check_slot_basics(con, "B")
         check("slot B sees the same /data", con.sh("cat /data/marker")[1].splitlines()[-1] == "kept")
+        check("activated Tailscale survives the OS update",
+              "/data/tailscale/releases/9999.0.0/" in tailscaled_exe(con), tailscaled_exe(con))
         version_b = con.sh("cat /etc/box-version")[1].splitlines()[-1]
         check("slot B runs the installed system", True, f"{version_b} (slot A: {version_a})")
 

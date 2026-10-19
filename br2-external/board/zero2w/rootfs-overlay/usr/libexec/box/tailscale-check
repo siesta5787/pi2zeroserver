@@ -1,0 +1,9 @@
+#!/bin/sh
+# Health check: the running tailscaled answers and is the active release.
+set -eu
+. /usr/libexec/box/tailscale-lib.sh
+want="$("$(ts_active_dir)/tailscale" version | head -n 1)"
+ts_wait_daemon "${want}" "${1:-90}" || {
+	echo "tailscaled is not answering as ${want} (got: '$(ts_daemon_version)')" >&2
+	exit 1
+}

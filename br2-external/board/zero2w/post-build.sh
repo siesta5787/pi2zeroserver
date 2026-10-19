@@ -10,7 +10,9 @@ SYSTEMCTL="${HOST_DIR}/bin/systemctl"
 "${SYSTEMCTL}" --root="${TARGET}" enable \
 	iwd.service systemd-networkd.service systemd-resolved.service \
 	systemd-timesyncd.service \
-	box-grow-data.service box-health-data.service box-mark-good.service
+	tailscaled.service \
+	box-grow-data.service box-health-data.service box-health-tailscale.service \
+	box-mark-good.service
 
 install -d -m 0755 "${TARGET}/data"
 

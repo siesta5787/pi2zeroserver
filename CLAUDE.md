@@ -22,6 +22,8 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
     it; `olddefconfig` does not), plus `<pkg>-dirclean` for packages you removed
   - `linux.fragment` → `./build.sh dev linux-reconfigure`
   - `uboot.fragment` or `patches/uboot/` → `./build.sh dev uboot-dirclean`
+  - `busybox.fragment` → `./build.sh dev busybox-dirclean` (BusyBox lacks many
+    applets by default, e.g. `timeout`, `stat`; check before using one in a script)
   - `config.txt` → `./build.sh dev rpi-firmware-rebuild`
   - `boot.cmd` → `./build.sh dev host-uboot-tools-rebuild` (boot.scr is compiled
     when host-uboot-tools builds, not on every build)

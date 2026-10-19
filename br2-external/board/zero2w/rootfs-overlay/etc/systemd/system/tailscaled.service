@@ -1,0 +1,19 @@
+[Unit]
+Description=Tailscale node agent
+Documentation=https://tailscale.com/kb/
+Wants=network-pre.target
+After=network-pre.target systemd-resolved.service systemd-tmpfiles-setup.service
+RequiresMountsFor=/data
+
+[Service]
+# Firewall rules via netlink; this image has no iptables tools
+Environment=TS_DEBUG_FIREWALL_MODE=nftables
+ExecStart=/usr/libexec/box/tailscale-launch tailscaled --statedir=/data/tailscale/state --socket=/run/tailscale/tailscaled.sock --port=41641
+ExecStopPost=/usr/libexec/box/tailscale-launch tailscaled --cleanup
+Type=notify
+Restart=on-failure
+RuntimeDirectory=tailscale
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

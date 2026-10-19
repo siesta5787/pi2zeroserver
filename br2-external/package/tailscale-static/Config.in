@@ -1,0 +1,10 @@
+config BR2_PACKAGE_TAILSCALE_STATIC
+	bool "tailscale-static"
+	depends on BR2_aarch64
+	help
+	  Tailscale's official static arm64 binaries (tailscale and
+	  tailscaled), installed to /usr/lib/box/tailscale as the copy
+	  built into the OS image. Newer releases can be activated on
+	  /data without an OS update (/usr/libexec/box/tailscale-activate).
+
+	  https://tailscale.com

@@ -1,0 +1,3 @@
+#!/bin/sh
+# The Tailscale CLI from the active release (see /usr/libexec/box/tailscale-lib.sh)
+exec /usr/libexec/box/tailscale-launch tailscale "$@"

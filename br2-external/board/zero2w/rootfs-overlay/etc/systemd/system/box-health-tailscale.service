@@ -1,0 +1,16 @@
+# Health check: tailscaled starts and answers. If an OS update breaks it, the
+# slot is never marked good and repeated boots roll back to the other slot.
+[Unit]
+Description=Health check: Tailscale running
+Before=boot-complete.target
+Requires=tailscaled.service
+After=tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/box/tailscale-check
+TimeoutStartSec=120
+
+[Install]
+RequiredBy=boot-complete.target
