@@ -1,0 +1,17 @@
+# Grows the data partition and its filesystem to the end of the SD card,
+# before it's checked and mounted.
+[Unit]
+Description=Grow the data partition to fill the SD card
+DefaultDependencies=no
+Wants=dev-disk-by\x2dlabel-data.device
+After=dev-disk-by\x2dlabel-data.device
+Before=systemd-fsck@dev-disk-by\x2dlabel-data.service data.mount shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/box/grow-data
+
+[Install]
+WantedBy=data.mount

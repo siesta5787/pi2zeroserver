@@ -1,4 +1,7 @@
 Machine-local files for dev builds (this folder is gitignored):
-  wifi.env  - Wi-Fi network the dev image joins (see wifi.env.example).
-              Stopgap until the setup hotspot exists.
-Changes take effect on the next ./build.sh (no full rebuild needed).
+  wifi.env  - Wi-Fi network dev images join (see wifi.env.example). Written to
+              the data partition, so it survives updates. Stopgap until the
+              setup hotspot exists; on an already-flashed card use
+              sudo tools/set-wifi.sh /media/$USER/data instead.
+  rauc/     - dev update signing key, generated on first build. Back it up:
+              dev devices only accept updates signed with it.

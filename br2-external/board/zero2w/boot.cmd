@@ -44,7 +44,7 @@ fi
 
 saveenv
 
-setenv bootargs "root=/dev/mmcblk0p${bootpart} rootfstype=ext4 rootwait console=ttyAMA0,115200 console=tty1 panic=5 rauc.slot=${raucslot}"
+setenv bootargs "root=/dev/mmcblk0p${bootpart} rootfstype=ext4 ro rootwait console=ttyAMA0,115200 console=tty1 panic=5 rauc.slot=${raucslot}"
 
 # The firmware loaded the device tree (with config.txt overlays) at ${fdt_addr}
 if load ${devtype} ${devnum}:${bootpart} ${kernel_addr_r} /boot/Image; then

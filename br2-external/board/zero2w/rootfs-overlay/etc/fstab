@@ -1,0 +1,6 @@
+# The root filesystem is a read-only A/B slot. /var is a tmpfs refilled from
+# /usr/share/factory/var at each boot; state that must survive reboots and
+# updates lives on /data and is bind-mounted into the services that own it.
+# <device>   <mount>  <type>  <options>                              <dump> <pass>
+/dev/root    /        auto    ro                                     0      0
+LABEL=data   /data    ext4    noatime,nodev,nosuid                   0      2

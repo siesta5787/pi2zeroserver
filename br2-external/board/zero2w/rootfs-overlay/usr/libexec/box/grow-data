@@ -1,0 +1,40 @@
+#!/bin/sh
+# Grow the data partition (the last one on the SD card) and its filesystem to
+# the end of the card, before /data is mounted. Does nothing once it's full size.
+set -eu
+
+part=$(basename "$(readlink -f /dev/disk/by-label/data)")
+disk=$(basename "$(readlink -f "/sys/class/block/${part}/..")")
+num=$(cat "/sys/class/block/${part}/partition")
+start=$(cat "/sys/class/block/${part}/start")
+size=$(cat "/sys/class/block/${part}/size")
+disk_size=$(cat "/sys/class/block/${disk}/size")
+
+# Sizes are in 512-byte sectors. Only act if at least 16 MiB is unused after
+# the partition, and only if it really is the last partition on the disk.
+free=$((disk_size - start - size))
+[ "${free}" -ge 32768 ] || exit 0
+for p in /sys/class/block/"${disk}"/"${disk}"p*; do
+	pstart=$(cat "${p}/start")
+	if [ "${pstart}" -gt "${start}" ]; then
+		echo "data partition is not the last partition; not growing it" >&2
+		exit 0
+	fi
+done
+
+echo "Growing /dev/${part} by $((free / 2048)) MiB"
+echo ", +" | sfdisk --no-reread --no-tell-kernel -N "${num}" "/dev/${disk}"
+# Tell the kernel about the new size without re-reading the whole table
+# (the root partition is in use)
+partx -u -n "${num}" "/dev/${disk}"
+# The size change makes udev re-probe the partition, briefly dropping
+# /dev/disk/by-label/data. Let that finish before /data gets mounted, or
+# systemd unmounts it again and cancels everything that needs it.
+udevadm settle
+
+# Grow the filesystem too, while it's still unmounted (resize2fs wants a
+# fresh check first; e2fsck exit code 1 means it fixed something)
+rc=0; e2fsck -fy "/dev/${part}" || rc=$?
+[ "${rc}" -le 1 ] || { echo "e2fsck failed (${rc}); not resizing" >&2; exit 1; }
+resize2fs "/dev/${part}"
+udevadm settle

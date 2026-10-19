@@ -23,7 +23,9 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
   - `linux.fragment` → `./build.sh dev linux-reconfigure`
   - `uboot.fragment` or `patches/uboot/` → `./build.sh dev uboot-dirclean`
   - `config.txt` → `./build.sh dev rpi-firmware-rebuild`
-  - rootfs overlay, `post-build.sh`, `post-image.sh`, `boot.cmd` → plain `./build.sh dev`
+  - `boot.cmd` → `./build.sh dev host-uboot-tools-rebuild` (boot.scr is compiled
+    when host-uboot-tools builds, not on every build)
+  - rootfs overlay, `post-build.sh`, `post-image.sh` → plain `./build.sh dev`
 - The project drive is a USB disk. After long builds, check
   `journalctl -k --since <build start> | grep -E "sdc|usb .*reset|I/O error"`.
   If writes failed, dirclean the packages built in that window: they can
@@ -32,14 +34,15 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
 ## Testing
 
 - `tools/qemu-ab-test.py` boots the image in QEMU (raspi3b, same SoC) and checks
-  first boot on slot A, no failed units, module loading, iwd, a signed install
-  into slot B, booting B, and rollback from a broken B. Run it after anything
+  first boot on slot A (marked good, read-only root, /data grown), a power cut,
+  a signed install into slot B, booting B with the same /data, and rollback
+  from a broken B. Run it after anything
   touching boot, U-Boot, RAUC, the kernel or systemd units. It runs ~20 min:
   launch it detached like a build. Its docstring lists the QEMU-only
   adaptations (U-Boot image header, pinmux, watchdog); keep production files
   free of QEMU workarounds.
-- Real device (dev builds): `sudo tools/set-wifi.sh /media/$USER/rootfs` puts
-  Wi-Fi on a flashed card; `tools/serve-updates.py` serves bundles for
+- Real device (dev builds): `sudo tools/set-wifi.sh /media/$USER/data` puts
+  Wi-Fi on a flashed card's data partition; `tools/serve-updates.py` serves bundles for
   `rauc install http://<pc>:8000/<bundle>` (RAUC streaming needs HTTP Range
   support, which `python3 -m http.server` lacks). The dev device answers at
   `box.local`; it has no SSH (by design).
@@ -54,6 +57,12 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
   `patches/uboot/0001-*` or it crashes before printing anything.
 - Kernel modules are xz-compressed: `CONFIG_MODULE_DECOMPRESS=y` is required or
   no module loads (no Wi-Fi).
+- Read-only root: anything a service must keep goes on `/data` via a
+  `BindPaths=` drop-in plus a `tmpfiles.d/box-data.conf` entry (see iwd,
+  timesyncd). Don't write into `/etc` or `/var` expecting it to persist.
+- Resizing a partition makes udev re-probe it and briefly drop its by-label
+  link; systemd then unmounts anything bound to it. `grow-data` does all
+  resizing before `/data` is mounted and waits with `udevadm settle`.
 - No RTC: `/usr/lib/clock-epoch` (stamped in `post-build.sh`) keeps the clock at
   least at build time, or offline devices reject bundle signatures.
 

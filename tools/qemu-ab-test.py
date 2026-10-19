@@ -2,8 +2,10 @@
 """End-to-end A/B update test in QEMU (raspi3b: same BCM2837 SoC as the Zero 2 W).
 
 Boots a copy of the dev sdcard.img and checks:
-  1. first boot uses slot A and marks it good
-  2. `rauc install` of a signed bundle switches to slot B, which boots and is marked good
+  1. first boot uses slot A, marks it good, has a read-only root and grows /data
+     to fill the card; then the power is cut
+  2. after the power cut /data is intact; `rauc install` of a signed bundle
+     switches to slot B, which boots, is marked good and sees the same /data
   3. a broken slot B (kernel removed) uses up its tries and rolls back to slot A
 
 QEMU has no Raspberry Pi firmware and a few emulation gaps, so the test builds
@@ -136,41 +138,40 @@ def partitions(card):
     return [(p["start"] * 512, p["size"] * 512) for p in table["partitiontable"]["partitions"]]
 
 
-def prepare_card(rootfs, bundle):
-    """Copy the image, swap in the QEMU rootfs, grow the data partition to fill a
-    power-of-2 card (QEMU's SD model needs that size) and put the bundle on it."""
+def prepare_card(rootfs):
+    """Copy the image, swap in the QEMU rootfs, and pad it to a power-of-2 size
+    (QEMU's SD model needs that). The device grows /data into the padding."""
     card = os.path.join(WORK, "sdcard.img")
     shutil.copyfile(os.path.join(IMAGES, "sdcard.img"), card)
-
     length = os.path.getsize(card)
     os.truncate(card, 1 << (length - 1).bit_length())
-    subprocess.run([os.path.join(SBIN, "sfdisk"), "--no-reread", "--no-tell-kernel", "-N", "4", card],
-                   input=", +\n", check=True, capture_output=True, text=True)
-    parts = partitions(card)
-
     with open(rootfs, "rb") as src, open(card, "r+b") as dst:
-        dst.seek(parts[1][0])
+        dst.seek(partitions(card)[1][0])
         shutil.copyfileobj(src, dst)
+    return card
 
-    start, size = parts[3]
+
+def inject_bundle(card, bundle):
+    """Copy the bundle onto the (now grown) data partition while QEMU is off."""
+    start, size = partitions(card)[3]
     part = os.path.join(WORK, "data.ext4")
     with open(card, "rb") as src, open(part, "wb") as dst:
         src.seek(start)
         dst.write(src.read(size))
-    os.truncate(part, size)
-    run(os.path.join(SBIN, "e2fsck"), "-fy", part)
-    run(os.path.join(SBIN, "resize2fs"), part)
+    # Replays the journal after the power cut; 1 = errors fixed, >=4 = not fixable
+    rc = subprocess.run([os.path.join(SBIN, "e2fsck"), "-fy", part], capture_output=True).returncode
+    if rc >= 4:
+        sys.exit(f"e2fsck could not repair the data partition (rc={rc})")
     run(os.path.join(SBIN, "debugfs"), "-w", "-R", f"write {bundle} update.raucb", part)
     with open(part, "rb") as src, open(card, "r+b") as dst:
         dst.seek(start)
         shutil.copyfileobj(src, dst)
     os.remove(part)
-    return card
 
 
 class Console:
     def __init__(self, card, uboot, dtb):
-        self.log = open(LOG, "w")
+        self.log = open(LOG, "a")
         self.buf = ""
         self.lock = threading.Lock()
         self.proc = subprocess.Popen(
@@ -259,36 +260,63 @@ def check(label, ok, detail=""):
         raise SystemExit(1)
 
 
+def check_slot_basics(con, slot):
+    check(f"slot {slot} marked good", env(con, f"BOOT_{slot}_LEFT") == "3",
+          f"BOOT_{slot}_LEFT={env(con, f'BOOT_{slot}_LEFT')}")
+    rc, failed = con.sh("systemctl --failed --no-legend --plain --no-pager", check=False)
+    check(f"no failed units on slot {slot}", not failed.strip(), failed.strip())
+    rc, out = con.sh("touch /etc/write-test", check=False)
+    check(f"slot {slot} root filesystem is read-only", rc != 0)
+    rc, out = con.sh("awk '$2 == \"/var\" {print $3}' /proc/mounts", check=False)
+    check(f"slot {slot} /var is a tmpfs", out.splitlines()[-1:] == ["tmpfs"], out)
+
+
 def main():
     # rauc runs mksquashfs etc. from the build's host tools
     os.environ["PATH"] = f"{HOST}/bin:{SBIN}:{os.environ['PATH']}"
     os.makedirs(WORK, exist_ok=True)
+    open(LOG, "w").close()
     step("building QEMU U-Boot from the production U-Boot build")
     uboot = prepare_uboot()
     step("preparing device tree, rootfs, test bundle and SD card")
     dtb = prepare_dtb()
     rootfs = qemu_rootfs()
-    card = prepare_card(rootfs, qemu_bundle(rootfs))
-    step("booting (QEMU's SD emulation is slow: allow ~2 minutes per boot)")
+    bundle = qemu_bundle(rootfs)
+    card = prepare_card(rootfs)
+
+    # 1. First boot: slot A, read-only root, /data grown to fill the card
+    step("first boot (QEMU's SD emulation is slow: allow ~2 minutes per boot)")
     con = Console(card, uboot, dtb)
     try:
-        # 1. First boot: slot A, marked good
         con.expect(r"Booting slot A", 300)
         con.login()
         check("first boot is slot A", booted_slot(con) == "A")
-        check("slot A marked good", env(con, "BOOT_A_LEFT") == "3",
-              f"BOOT_A_LEFT={env(con, 'BOOT_A_LEFT')}")
-        rc, failed = con.sh("systemctl --failed --no-legend --plain --no-pager", check=False)
-        check("no failed units on slot A", not failed.strip(), failed.strip())
+        check_slot_basics(con, "A")
         rc, out = con.sh("modprobe pkcs8_key_parser && lsmod | grep -c pkcs8", check=False)
-        check("kernel modules load", rc == 0, out.splitlines()[-1] if out else "")
+        check("kernel modules load", rc == 0)
         rc, out = con.sh("lsmod | grep -c '^cfg80211'", check=False)
         check("wireless stack loaded at boot", rc == 0)
         rc, out = con.sh("systemctl is-active iwd", check=False)
         check("iwd running", rc == 0, out.splitlines()[-1] if out else "")
+        kb = int(con.sh("df -k /data | awk 'END {print $2}'")[1].split()[-1])
+        # The test card is 2 GiB; boot + both slots take ~1.1 GiB of it
+        check("/data grown to fill the card", kb > 800_000, f"{kb // 1024} MiB")
+        rc, out = con.sh("ls -ld /data/iwd /data/rauc | cut -c1-10", check=False)
+        check("/data state folders created", rc == 0 and out.split() == ["drwx------"] * 2, out)
+        con.sh("echo kept > /data/marker && sync")
+    finally:
+        con.stop()  # pull the power
+
+    # 2. After the power cut: /data intact; update into slot B
+    step("power cut done; copying the update bundle onto /data offline")
+    inject_bundle(card, bundle)
+    con = Console(card, uboot, dtb)
+    try:
+        con.expect(r"Booting slot A", 300)
+        con.login()
+        check("/data intact after power cut", con.sh("cat /data/marker")[1].splitlines()[-1] == "kept")
         version_a = con.sh("cat /etc/box-version")[1].splitlines()[-1]
 
-        # 2. Install the update into slot B and boot it
         rc, out = con.sh("rauc install /data/update.raucb", timeout=1800, check=False)
         check("rauc install succeeds", rc == 0, out.splitlines()[-1] if out else "")
         check("B is now first in boot order", env(con, "BOOT_ORDER") == "B A",
@@ -297,8 +325,8 @@ def main():
         con.expect(r"Booting slot B", 900)
         con.login()
         check("update boots slot B", booted_slot(con) == "B")
-        check("slot B marked good", env(con, "BOOT_B_LEFT") == "3",
-              f"BOOT_B_LEFT={env(con, 'BOOT_B_LEFT')}")
+        check_slot_basics(con, "B")
+        check("slot B sees the same /data", con.sh("cat /data/marker")[1].splitlines()[-1] == "kept")
         version_b = con.sh("cat /etc/box-version")[1].splitlines()[-1]
         check("slot B runs the installed system", True, f"{version_b} (slot A: {version_a})")
 

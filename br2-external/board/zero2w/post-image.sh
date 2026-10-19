@@ -16,19 +16,29 @@ grep '^CONFIG_' "${BOARD_DIR}/uboot.fragment" | while read -r opt; do
 	}
 done
 
-# genimage copies --rootpath into its tmp dir; give it an empty one. The rootfs
-# is already built, and the data partition should start empty.
+# genimage only uses --rootpath for the data partition (its "/data" subdir);
+# the rootfs is already built. /data starts empty, except that dev builds get
+# the Wi-Fi network from the gitignored local/wifi.env.
 ROOTPATH_TMP="$(mktemp -d)"
 BUNDLE_TMP="$(mktemp -d)"
 trap 'rm -rf "${ROOTPATH_TMP}" "${BUNDLE_TMP}"' EXIT
+install -d -m 0755 "${ROOTPATH_TMP}/data"
 
+if [ "${2:-}" = dev ] && [ -f "${BOX_PROJECT_DIR}/local/wifi.env" ]; then
+	# shellcheck disable=SC1091
+	(. "${BOX_PROJECT_DIR}/local/wifi.env" && export WIFI_SSID WIFI_PASSWORD &&
+		SET_WIFI_NO_ROOT=1 "${BOX_PROJECT_DIR}/tools/set-wifi.sh" "${ROOTPATH_TMP}/data")
+fi
+
+# fakeroot so files on the data partition are owned by root, not the build user
 rm -rf "${GENIMAGE_TMP}"
-genimage \
-	--rootpath "${ROOTPATH_TMP}" \
-	--tmppath "${GENIMAGE_TMP}" \
-	--inputpath "${BINARIES_DIR}" \
-	--outputpath "${BINARIES_DIR}" \
-	--config "${BOARD_DIR}/genimage.cfg"
+fakeroot -- sh -c 'chown -R 0:0 "$1" && exec genimage \
+	--rootpath "$1" \
+	--tmppath "$2" \
+	--inputpath "$3" \
+	--outputpath "$3" \
+	--config "$4"' \
+	sh "${ROOTPATH_TMP}" "${GENIMAGE_TMP}" "${BINARIES_DIR}" "${BOARD_DIR}/genimage.cfg"
 
 # Compressed copy for Raspberry Pi Imager / balenaEtcher
 xz -T0 -6 -f -k "${BINARIES_DIR}/sdcard.img"

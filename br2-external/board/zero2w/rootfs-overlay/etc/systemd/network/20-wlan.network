@@ -5,3 +5,8 @@ Name=wlan0
 DHCP=yes
 MulticastDNS=yes
 LLMNR=no
+
+[DHCPv4]
+# machine-id is regenerated each boot (read-only root), so identify by MAC
+# to keep the same DHCP lease
+ClientIdentifier=mac

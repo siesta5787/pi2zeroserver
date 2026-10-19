@@ -138,11 +138,14 @@ RPi Server DIstro/          (this folder, git)
 ## Work order
 
 1. ✅ Boots on Wi-Fi: dev defconfig, systemd, iwd. (SSH dropped; Wi-Fi for dev
-   cards via `local/wifi.env` or `sudo tools/set-wifi.sh <mounted rootfs>`.)
+   cards via `local/wifi.env` or `sudo tools/set-wifi.sh <mounted data partition>`.)
 2. ✅ A/B: genimage, U-Boot bootcount script, RAUC, mark-good. Passes
    `tools/qemu-ab-test.py` (boot A → install to B → forced rollback to A).
+   Verified on a Zero 2 W: streamed install over Wi-Fi, booted slot B.
    Still to do on real hardware: power loss mid-update.
-3. `/data`: grows on first boot, persistent `/etc` bits, read-only rootfs.
+3. ✅ `/data`: grows on first boot, read-only rootfs, `/var` in RAM; Wi-Fi
+   (iwd), RAUC status and timesyncd's clock persist on `/data` via bind mounts.
+   QEMU test covers first-boot growth, a power cut, and `/data` shared by both slots.
 4. Tailscale: rootfs copy, state on `/data`, swap/rollback updater.
 5. Agent: proxy, status, manifest, OS/app/Tailscale update flows.
 6. Onboarding: AP, captive portal, Tailscale QR.

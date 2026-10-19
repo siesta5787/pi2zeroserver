@@ -48,7 +48,7 @@ ln -sfn "${PROJECT_DIR}/br2-external" "${BUILD_ROOT}/br2-external"
 
 export BR2_DL_DIR="${BUILD_ROOT}/cache/dl"
 export BR2_CCACHE_DIR="${BUILD_ROOT}/cache/ccache"
-export BOX_LOCAL_DIR="${PROJECT_DIR}/local"
+export BOX_PROJECT_DIR="${PROJECT_DIR}"
 
 # Version stamped into /etc/box-version and the RAUC bundle. Sorts by build time.
 dirty="$(git -C "${PROJECT_DIR}" diff --quiet HEAD -- 2>/dev/null || echo -dirty)"
