@@ -2,6 +2,7 @@
 
 use std::fmt::Write;
 
+use crate::os_update::Install;
 use crate::status::Status;
 
 /// Escapes text for HTML element content and attribute values.
@@ -29,9 +30,17 @@ p{margin:.25rem 0}.ok{color:#11632a}.warn{color:#8a4b00}.muted{color:#555;font-s
 a{color:#0b57d0}";
 
 fn page(title: &str, body: &str) -> String {
+    page_refreshing(title, body, None)
+}
+
+/// A page that reloads itself every `refresh` seconds (progress without JavaScript)
+fn page_refreshing(title: &str, body: &str, refresh: Option<(u32, &str)>) -> String {
+    let refresh = refresh
+        .map(|(secs, url)| format!("<meta http-equiv=\"refresh\" content=\"{secs};url={}\">", esc(url)))
+        .unwrap_or_default();
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{refresh}\
          <title>{}</title><style>{STYLE}</style></head><body>{body}</body></html>",
         esc(title)
     )
@@ -50,13 +59,43 @@ fn duration(seconds: u64) -> String {
     }
 }
 
-pub fn status(s: &Status) -> String {
+fn update_section(install: &Install) -> String {
+    let body = match install {
+        Install::Running { percent, step } => format!(
+            "<p class=\"warn\">Installing an update: {percent}%</p><p class=\"muted\">{}</p>\
+             <p>You can keep using the app. The box restarts when you say so.</p>",
+            esc(step)
+        ),
+        Install::Installed => "<p class=\"ok\">An update is installed. Restart to start using it.</p>\
+             <form method=\"post\" action=\"/_system/restart\"><button>Restart now</button></form>"
+            .to_owned(),
+        Install::Failed { error } => format!(
+            "<p class=\"warn\">The last update didn't install. Nothing was changed.</p>\
+             <p class=\"muted\">{}</p>",
+            esc(error)
+        ),
+        Install::Idle => String::new(),
+    };
+    let advanced = if matches!(install, Install::Running { .. }) {
+        ""
+    } else {
+        "<details><summary class=\"muted\">Install from an address</summary>\
+         <form method=\"post\" action=\"/_system/os/install\"><p><input name=\"source\" \
+         type=\"text\" inputmode=\"url\" placeholder=\"https://.../box-....raucb\" required \
+         style=\"width:100%\"></p><p><button>Install</button></p></form></details>"
+    };
+    format!("<section><h2>Updates</h2>{body}{advanced}</section>")
+}
+
+pub fn status(s: &Status, install: &Install) -> String {
     let mut b = String::from("<h1>Box</h1>");
 
     // System
     let backup = s.os.slots.iter().find(|slot| Some(&slot.name) != s.os.booted_slot.as_ref());
     let backup_line = match backup {
-        Some(slot) if slot.boot_status == "good" => "A backup copy of the system is ready if an update ever fails.",
+        Some(slot) if slot.boot_status == "good" => {
+            "A backup copy of the system is ready if an update ever fails."
+        }
         _ => "No backup copy yet; one is made with the first update.",
     };
     let _ = write!(
@@ -92,13 +131,28 @@ pub fn status(s: &Status) -> String {
         None => "<p class=\"warn\">The data area isn't available.</p>".to_owned(),
     };
     let _ = write!(b, "<section><h2>Storage</h2>{storage}</section>");
+    b.push_str(&update_section(install));
 
     b.push_str(
         "<p class=\"muted\"><a href=\"/\">Open the app</a> · \
          <a href=\"/_system/password\">Change password</a></p>\
          <form method=\"post\" action=\"/_system/logout\"><button>Sign out</button></form>",
     );
-    page("Box", &b)
+    let refresh = matches!(install, Install::Running { .. }).then_some((3, "/_system/"));
+    page_refreshing("Box", &b, refresh)
+}
+
+pub fn message(title: &str, text: &str) -> String {
+    page(title, &format!("<h1>{}</h1><p>{}</p><p><a href=\"/_system/\">Back</a></p>", esc(title), esc(text)))
+}
+
+pub fn restarting() -> String {
+    page_refreshing(
+        "Restarting",
+        "<h1>Restarting…</h1><p>The box is restarting. This page will reload by itself \
+         in about a minute.</p>",
+        Some((60, "/_system/")),
+    )
 }
 
 fn error_line(error: Option<&str>) -> String {
@@ -187,12 +241,24 @@ mod tests {
             data: Some(Disk { total_bytes: 30_000_000_000, free_bytes: 29_500_000_000 }),
             uptime_seconds: 3 * 3600 + 5 * 60,
         };
-        let html = status(&s);
+        let html = status(&s, &Install::Idle);
         assert!(!html.contains("<script>") && html.contains("&lt;script&gt;"));
         assert!(html.contains("evil&lt;b&gt;"));
         assert!(html.contains("A backup copy of the system is ready"));
         assert!(html.contains("29.5 GB free of 30.0 GB"));
         assert!(html.contains("up 3 h 5 min"));
+    }
+
+    #[test]
+    fn update_progress_refreshes_and_escapes() {
+        let running = update_section(&Install::Running { percent: 40, step: "<Copying>".into() });
+        assert!(
+            running.contains("40%") && running.contains("&lt;Copying&gt;") && !running.contains("<details>")
+        );
+        let failed = update_section(&Install::Failed { error: "bad <sig>".into() });
+        assert!(failed.contains("bad &lt;sig&gt;") && failed.contains("<details>"));
+        let installed = update_section(&Install::Installed);
+        assert!(installed.contains("/_system/restart"));
     }
 
     #[test]

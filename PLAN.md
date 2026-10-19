@@ -170,9 +170,13 @@ RPi Server DIstro/          (this folder, git)
      SameSite=Strict cookie, per-address lockout, Origin check on posts. Only
      /_system/api/health is public; localhost gets no special trust (tailscale
      serve forwards from 127.0.0.1).
+   - ✅ 5d: OS install from the agent: runs `rauc install` (RAUC's service does
+     the work) and follows its progress; status page shows progress (self-
+     refreshing, no JS), "installed — Restart now", or the error. Sources:
+     http(s) URLs or *.raucb files under /data.
    - 5c: signed update manifest + "update available" (needs: where releases
-     are hosted); 5d: OS install via RAUC D-Bus with progress; 5e: Tailscale
-     download + distsign verify + activate; 5f: app releases with activate/rollback
+     are hosted); 5e: Tailscale download + distsign verify + activate;
+     5f: app releases with activate/rollback
 6. Onboarding: AP, captive portal, Tailscale QR.
 7. Hardening: firewall, sandboxing, release defconfig (no curl CLI, no HDMI
    console login, release signing key).

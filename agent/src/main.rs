@@ -9,6 +9,7 @@
 //! bad app update can never take away the page used to fix it.
 
 mod auth;
+mod os_update;
 mod pages;
 mod proxy;
 mod status;
@@ -28,6 +29,20 @@ use serde::Deserialize;
 struct AppState {
     proxy: proxy::Proxy,
     auth: Arc<auth::Auth>,
+    os_update: os_update::OsUpdate,
+    /// Command that restarts the box (replaced in tests)
+    reboot: Arc<Vec<String>>,
+}
+
+impl AppState {
+    fn new(app: SocketAddr, data_dir: PathBuf) -> Self {
+        Self {
+            proxy: proxy::Proxy::new(app),
+            auth: Arc::new(auth::Auth::new(data_dir)),
+            os_update: os_update::OsUpdate::new("rauc".into()),
+            reboot: Arc::new(vec!["systemctl".into(), "reboot".into()]),
+        }
+    }
 }
 
 struct Args {
@@ -67,18 +82,66 @@ fn router(state: AppState) -> Router {
         .route("/_system/password", get(password_page).post(password_submit))
         .route("/_system/api/health", get(|| async { "ok" }))
         .route("/_system/api/status", get(status_json))
+        .route("/_system/api/os/install", get(os_install_state).post(os_install_api))
+        .route("/_system/os/install", post(os_install_form))
+        .route("/_system/restart", post(restart))
         // Unknown system paths stay with the agent rather than reaching the app
         .route("/_system/{*rest}", any(|| async { StatusCode::NOT_FOUND }))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard));
     Router::new().merge(system).fallback(proxy::forward).with_state(state)
 }
 
-async fn status_page() -> impl IntoResponse {
-    Html(pages::status(&status::gather().await))
+async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
+    Html(pages::status(&status::gather().await, &state.os_update.state()))
 }
 
 async fn status_json() -> impl IntoResponse {
     axum::Json(status::gather().await)
+}
+
+#[derive(Deserialize)]
+struct InstallForm {
+    source: String,
+}
+
+async fn os_install_state(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.os_update.state())
+}
+
+/// Starts an install; 202 with the new state, or why it can't start
+async fn os_install_api(State(state): State<AppState>, Form(form): Form<InstallForm>) -> Response {
+    match state.os_update.start(&form.source) {
+        Ok(()) => (StatusCode::ACCEPTED, axum::Json(state.os_update.state())).into_response(),
+        Err(os_update::StartError::AlreadyRunning) => {
+            (StatusCode::CONFLICT, "an update is already installing").into_response()
+        }
+        Err(os_update::StartError::BadSource) => {
+            (StatusCode::BAD_REQUEST, "not an update address").into_response()
+        }
+    }
+}
+
+async fn os_install_form(State(state): State<AppState>, Form(form): Form<InstallForm>) -> Response {
+    match state.os_update.start(&form.source) {
+        Ok(()) | Err(os_update::StartError::AlreadyRunning) => Redirect::to("/_system/").into_response(),
+        Err(os_update::StartError::BadSource) => (
+            StatusCode::BAD_REQUEST,
+            Html(pages::message("Can't install that", "That isn't an update address.")),
+        )
+            .into_response(),
+    }
+}
+
+/// Restarts the box shortly after answering, so the page still arrives.
+async fn restart(State(state): State<AppState>) -> impl IntoResponse {
+    let cmd = state.reboot.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Err(e) = tokio::process::Command::new(&cmd[0]).args(&cmd[1..]).status().await {
+            eprintln!("restarting: {e}");
+        }
+    });
+    Html(pages::restarting())
 }
 
 /// Response that logs the browser in and continues to the status page
@@ -146,12 +209,14 @@ async fn password_submit(State(state): State<AppState>, Form(form): Form<Passwor
         None
     };
     if let Some(problem) = problem {
-        return (StatusCode::BAD_REQUEST, Html(pages::set_password(first_run, Some(&problem)))).into_response();
+        return (StatusCode::BAD_REQUEST, Html(pages::set_password(first_run, Some(&problem))))
+            .into_response();
     }
     if let Err(e) = state.auth.set_password(form.password).await {
         eprintln!("saving the admin password: {e}");
         let msg = "The password couldn't be saved. Try again.";
-        return (StatusCode::INTERNAL_SERVER_ERROR, Html(pages::set_password(first_run, Some(msg)))).into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, Html(pages::set_password(first_run, Some(msg))))
+            .into_response();
     }
     signed_in(&state.auth.new_session())
 }
@@ -174,10 +239,7 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let state = AppState {
-        proxy: proxy::Proxy::new(args.app),
-        auth: Arc::new(auth::Auth::new(args.data_dir)),
-    };
+    let state = AppState::new(args.app, args.data_dir);
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -211,10 +273,8 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = AppState {
-            proxy: proxy::Proxy::new(app),
-            auth: Arc::new(auth::Auth::new(data.path().to_owned())),
-        };
+        let mut state = AppState::new(app, data.path().to_owned());
+        state.reboot = Arc::new(vec!["true".into()]);
         let service = router(state).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
         Agent { addr, _data: data }
@@ -238,7 +298,13 @@ mod tests {
     }
 
     /// Sends a request the way a browser on this box's own page would.
-    async fn send(agent: &Agent, method: &str, path: &str, cookie: Option<&str>, form: Option<&str>) -> Reply {
+    async fn send(
+        agent: &Agent,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        form: Option<&str>,
+    ) -> Reply {
         let mut req = hyper::Request::builder()
             .method(method)
             .uri(format!("http://{}{path}", agent.addr))
@@ -259,7 +325,11 @@ mod tests {
         let resp = client.request(req.body(body).unwrap()).await.unwrap();
         let (parts, body) = resp.into_parts();
         let body = body.collect().await.unwrap().to_bytes();
-        Reply { status: parts.status, headers: parts.headers, body: String::from_utf8_lossy(&body).into_owned() }
+        Reply {
+            status: parts.status,
+            headers: parts.headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        }
     }
 
     async fn fetch(agent: &Agent, path: &str, cookie: Option<&str>) -> Reply {
@@ -272,7 +342,8 @@ mod tests {
 
     /// Sets the first password; returns the session cookie it logs in with.
     async fn set_up(agent: &Agent) -> String {
-        let r = submit(agent, "/_system/password", None, "password=correct+horse&confirm=correct+horse").await;
+        let r =
+            submit(agent, "/_system/password", None, "password=correct+horse&confirm=correct+horse").await;
         assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
         assert_eq!(r.location(), "/_system/");
         r.cookie()
@@ -305,7 +376,8 @@ mod tests {
         let agent = start_agent(unused_port().await).await;
         let r = submit(&agent, "/_system/password", None, "password=short&confirm=short").await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST);
-        let r = submit(&agent, "/_system/password", None, "password=correct+horse&confirm=correct+hors").await;
+        let r =
+            submit(&agent, "/_system/password", None, "password=correct+horse&confirm=correct+hors").await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST);
         assert!(r.body.contains("don&#39;t match"));
     }
@@ -341,7 +413,10 @@ mod tests {
         let r = submit(&agent, "/_system/password", None, "password=new+password&confirm=new+password").await;
         assert_eq!(r.location(), "/_system/login");
         let form = "current=nope&password=new+password&confirm=new+password";
-        assert_eq!(submit(&agent, "/_system/password", Some(&cookie), form).await.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            submit(&agent, "/_system/password", Some(&cookie), form).await.status,
+            StatusCode::BAD_REQUEST
+        );
         let form = "current=correct+horse&password=new+password&confirm=new+password";
         assert_eq!(submit(&agent, "/_system/password", Some(&cookie), form).await.location(), "/_system/");
         let r = submit(&agent, "/_system/login", None, "password=new+password").await;
@@ -361,6 +436,28 @@ mod tests {
         let client = Client::builder(TokioExecutor::new()).build_http::<Body>();
         assert_eq!(client.request(req).await.unwrap().status(), StatusCode::FORBIDDEN);
         assert_eq!(fetch(&agent, "/_system/api/status", Some(&cookie)).await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn os_install_api_needs_login_and_a_valid_source() {
+        let agent = start_agent(unused_port().await).await;
+        let cookie = set_up(&agent).await;
+        let r =
+            submit(&agent, "/_system/api/os/install", None, "source=https%3A%2F%2Fx.example%2Fa.raucb").await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        let r = submit(&agent, "/_system/api/os/install", Some(&cookie), "source=%2Fetc%2Fshadow").await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        let r = fetch(&agent, "/_system/api/os/install", Some(&cookie)).await;
+        assert_eq!(r.body, r#"{"state":"idle"}"#);
+    }
+
+    #[tokio::test]
+    async fn restart_answers_before_restarting() {
+        let agent = start_agent(unused_port().await).await;
+        let cookie = set_up(&agent).await;
+        let r = submit(&agent, "/_system/restart", Some(&cookie), "").await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert!(r.body.contains("Restarting"));
     }
 
     #[tokio::test]

@@ -87,12 +87,8 @@ impl Auth {
         std::fs::create_dir_all(&dir)?;
         {
             use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
+            let mut f =
+                std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
             f.write_all(hash.as_bytes())?;
             f.sync_all()?;
         }
@@ -180,10 +176,8 @@ fn same_origin(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    let source = headers
-        .get(header::ORIGIN)
-        .or_else(|| headers.get(header::REFERER))
-        .and_then(|v| v.to_str().ok());
+    let source =
+        headers.get(header::ORIGIN).or_else(|| headers.get(header::REFERER)).and_then(|v| v.to_str().ok());
     match source {
         Some(url) => {
             let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"));
@@ -245,7 +239,10 @@ mod tests {
         assert!(same_origin(&headers(&[("host", "box.local"), ("origin", "http://box.local")])));
         assert!(same_origin(&headers(&[("host", "box.local"), ("referer", "http://box.local/_system/")])));
         assert!(!same_origin(&headers(&[("host", "box.local"), ("origin", "http://evil.example")])));
-        assert!(!same_origin(&headers(&[("host", "box.local"), ("origin", "http://box.local.evil.example")])));
+        assert!(!same_origin(&headers(&[
+            ("host", "box.local"),
+            ("origin", "http://box.local.evil.example")
+        ])));
         assert!(!same_origin(&headers(&[("host", "box.local")])));
     }
 

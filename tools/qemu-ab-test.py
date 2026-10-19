@@ -300,6 +300,34 @@ def agent_post(con, path, form):
     return m.group(1) if m else ""
 
 
+def agent_api(con, path, cookie, form=None, timeout=60):
+    """Call the agent's API as a logged-in browser; returns (HTTP status, body)."""
+    data = f"-H 'Origin: http://127.0.0.1' -d '{form}' " if form is not None else ""
+    out = con.sh(f"curl -s -m 30 -w '\\n%{{http_code}}' -H 'Cookie: {cookie}' {data}http://127.0.0.1{path}",
+                 timeout=timeout, check=False)[1].splitlines()
+    return (int(out[-1]) if out and out[-1].isdigit() else 0), "\n".join(out[:-1])
+
+
+def install_via_agent(con):
+    """Install /data/update.raucb the way the system page does, and wait for it."""
+    cookie = agent_post(con, "/_system/login", f"password={ADMIN_PASSWORD}")
+    code, body = agent_api(con, "/_system/api/os/install", cookie, "source=%2Fdata%2Fupdate.raucb")
+    check("agent starts the OS install", code == 202, f"{code} {body}")
+    deadline = time.time() + 1800
+    state = {}
+    while time.time() < deadline:
+        code, body = agent_api(con, "/_system/api/os/install", cookie)
+        try:
+            state = json.loads(body.splitlines()[-1])
+        except (ValueError, IndexError):
+            state = {}
+        if state.get("state") != "running":
+            break
+        time.sleep(15)
+    check("agent reports the update installed", state.get("state") == "installed", str(state))
+    return cookie
+
+
 def check_agent(con, slot):
     rc, out = con.sh("wget -q -T 10 -O - http://127.0.0.1/_system/api/health", check=False)
     check(f"agent answers on slot {slot}", rc == 0 and out.splitlines()[-1:] == ["ok"], out)
@@ -399,11 +427,11 @@ def main():
         check("/data intact after power cut", con.sh("cat /data/marker")[1].splitlines()[-1] == "kept")
         version_a = con.sh("cat /etc/box-version")[1].splitlines()[-1]
 
-        rc, out = con.sh("rauc install /data/update.raucb", timeout=1800, check=False)
-        check("rauc install succeeds", rc == 0, out.splitlines()[-1] if out else "")
+        cookie = install_via_agent(con)
         check("B is now first in boot order", env(con, "BOOT_ORDER") == "B A",
               f"BOOT_ORDER={env(con, 'BOOT_ORDER')}")
-        con.send("reboot\n")
+        code, body = agent_api(con, "/_system/restart", cookie, "")
+        check("Restart button restarts the box", code == 200 and "Restarting" in body, str(code))
         con.expect(r"Booting slot B", 900)
         con.login()
         check("update boots slot B", booted_slot(con) == "B")

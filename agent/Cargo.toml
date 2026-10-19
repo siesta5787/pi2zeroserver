@@ -17,11 +17,11 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "net", "macros", "process", "fs", "time", "signal"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "process", "fs", "time", "signal", "io-util"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "net", "macros", "process", "fs", "time", "signal", "rt-multi-thread"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "process", "fs", "time", "signal", "io-util", "rt-multi-thread"] }
 
 [profile.release]
 opt-level = "s"
