@@ -1,0 +1,4 @@
+Machine-local files for dev builds (this folder is gitignored):
+  wifi.env  - Wi-Fi network the dev image joins (see wifi.env.example).
+              Stopgap until the setup hotspot exists.
+Changes take effect on the next ./build.sh (no full rebuild needed).

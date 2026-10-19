@@ -1,0 +1,15 @@
+# Box appliance - Raspberry Pi Zero 2 W (headless)
+arm_64bit=1
+kernel=Image
+
+# Headless: cut-down GPU firmware and the minimum GPU memory
+start_file=start_cd.elf
+fixup_file=fixup_cd.dat
+gpu_mem=16
+
+# Bluetooth off; frees the PL011 UART for a serial console on GPIO14/15
+dtoverlay=disable-bt
+enable_uart=1
+
+disable_splash=1
+boot_delay=0

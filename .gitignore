@@ -1,0 +1,4 @@
+# Machine-local secrets (Wi-Fi password) baked into dev builds only
+/local/*
+!/local/README
+!/local/wifi.env.example
