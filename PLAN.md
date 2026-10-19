@@ -162,6 +162,15 @@ RPi Server DIstro/          (this folder, git)
    QEMU test covers activate, broken-release rollback, and surviving an OS update.
    Downloading/verifying releases is the agent's job (step 5).
 5. Agent: proxy, status, manifest, OS/app/Tailscale update flows.
+   - ✅ 5a: `agent/` (Rust, built by Buildroot's cargo-package with Rust 1.88):
+     port 80, `/_system/` status page + `/_system/api/{health,status}`, reverse
+     proxy to 127.0.0.1:8080 with a friendly page when the app is down, boot
+     health check. 1.3 MB binary.
+   - 5b: signed update manifest + "update available" (needs: where releases
+     are hosted)
+   - 5c: OS install via RAUC D-Bus with progress; 5d: Tailscale download +
+     distsign verify + activate; 5e: app releases with activate/rollback;
+     5f: admin password, sessions, CSRF
 6. Onboarding: AP, captive portal, Tailscale QR.
 7. Hardening: firewall, sandboxing, release defconfig without SSH.
 8. Releases: CI pipeline, signed manifest, Imager repo, novice guide.

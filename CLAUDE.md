@@ -28,6 +28,10 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
   - `boot.cmd` → `./build.sh dev host-uboot-tools-rebuild` (boot.scr is compiled
     when host-uboot-tools builds, not on every build)
   - rootfs overlay, `post-build.sh`, `post-image.sh` → plain `./build.sh dev`
+  - `agent/` sources → `./build.sh dev box-agent-rebuild` (local package; Buildroot
+    re-copies it only on rebuild). Run `cargo test` in `agent/` first: the agent
+    targets Rust 1.88 (Buildroot's), so keep `rust-version` and let Cargo pick
+    compatible crate versions.
 - The project drive is a USB disk. After long builds, check
   `journalctl -k --since <build start> | grep -E "sdc|usb .*reset|I/O error"`.
   If writes failed, dirclean the packages built in that window: they can

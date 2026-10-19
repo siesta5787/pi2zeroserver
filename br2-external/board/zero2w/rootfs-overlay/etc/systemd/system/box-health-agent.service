@@ -1,0 +1,17 @@
+# Health check: the agent answers. Without it nobody can see or fix the box,
+# so an OS update that breaks it is never marked good.
+[Unit]
+Description=Health check: agent answering
+Before=boot-complete.target
+Requires=box-agent.service
+After=box-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for i in $(seq 60); do \
+	[ "$(wget -q -T 5 -O - http://127.0.0.1/_system/api/health)" = ok ] && exit 0; sleep 1; done; exit 1'
+TimeoutStartSec=120
+
+[Install]
+RequiredBy=boot-complete.target

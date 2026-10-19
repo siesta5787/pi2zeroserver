@@ -1,0 +1,8 @@
+config BR2_PACKAGE_BOX_AGENT
+	bool "box-agent"
+	depends on BR2_PACKAGE_HOST_RUSTC_TARGET_ARCH_SUPPORTS
+	select BR2_PACKAGE_HOST_RUSTC
+	help
+	  The appliance's front door on port 80: system pages and API
+	  under /_system/, and a reverse proxy to the user's app on
+	  127.0.0.1:8080. Source: agent/ in this repository.

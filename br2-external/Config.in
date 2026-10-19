@@ -1,1 +1,2 @@
 source "$BR2_EXTERNAL_BOX_PATH/package/tailscale-static/Config.in"
+source "$BR2_EXTERNAL_BOX_PATH/package/box-agent/Config.in"

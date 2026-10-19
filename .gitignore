@@ -4,3 +4,5 @@
 !/local/wifi.env.example
 
 __pycache__/
+/agent/target/
+/agent/vendor/

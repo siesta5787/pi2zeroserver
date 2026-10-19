@@ -288,6 +288,21 @@ def stage_release(con, version, broken_daemon=False):
            f"&& echo {version} > {rel}/VERSION && sync", timeout=600)
 
 
+def check_agent(con, slot):
+    rc, out = con.sh("wget -q -T 10 -O - http://127.0.0.1/_system/api/health", check=False)
+    check(f"agent answers on slot {slot}", rc == 0 and out.splitlines()[-1:] == ["ok"], out)
+    rc, out = con.sh("wget -q -T 30 -O - http://127.0.0.1/_system/api/status", timeout=60, check=False)
+    try:
+        status = json.loads(out.splitlines()[-1])
+    except (ValueError, IndexError):
+        status = {}
+    check(f"status API reports slot {slot}", status.get("os", {}).get("booted_slot") == slot, out[-200:])
+    check("status API reports Tailscale", status.get("tailscale", {}).get("running") is True,
+          str(status.get("tailscale")))
+    rc, out = con.sh("wget -T 10 -O /dev/null http://127.0.0.1/ 2>&1", check=False)
+    check("no app installed: friendly 502 page", "502" in out, out.splitlines()[-1] if out else "")
+
+
 def check_tailscale(con):
     builtin = con.sh("cat /usr/lib/box/tailscale/VERSION")[1].splitlines()[-1]
     rc, out = con.sh("systemctl is-active tailscaled", check=False)
@@ -345,6 +360,7 @@ def main():
         check("/data grown to fill the card", kb > 800_000, f"{kb // 1024} MiB")
         rc, out = con.sh("ls -ld /data/iwd /data/rauc | cut -c1-10", check=False)
         check("/data state folders created", rc == 0 and out.split() == ["drwx------"] * 2, out)
+        check_agent(con, "A")
         check_tailscale(con)
         con.sh("echo kept > /data/marker && sync")
     finally:
@@ -370,6 +386,7 @@ def main():
         check("update boots slot B", booted_slot(con) == "B")
         check_slot_basics(con, "B")
         check("slot B sees the same /data", con.sh("cat /data/marker")[1].splitlines()[-1] == "kept")
+        check_agent(con, "B")
         check("activated Tailscale survives the OS update",
               "/data/tailscale/releases/9999.0.0/" in tailscaled_exe(con), tailscaled_exe(con))
         version_b = con.sh("cat /etc/box-version")[1].splitlines()[-1]

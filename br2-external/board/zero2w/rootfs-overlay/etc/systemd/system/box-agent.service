@@ -1,0 +1,24 @@
+[Unit]
+Description=Box agent: system pages, app proxy and updates
+Wants=network.target
+After=network.target tailscaled.service
+
+[Service]
+ExecStart=/usr/bin/box-agent
+Restart=always
+RestartSec=2
+# Runs as root (it drives RAUC, Tailscale and systemd) but can't gain more
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
