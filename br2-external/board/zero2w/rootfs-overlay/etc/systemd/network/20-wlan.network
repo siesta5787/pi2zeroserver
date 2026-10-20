@@ -1,5 +1,7 @@
+# The box on the home Wi-Fi (iwd in station mode)
 [Match]
 Name=wlan0
+WLANInterfaceType=station
 
 [Network]
 DHCP=yes

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Set (or change) the Wi-Fi network on a flashed SD card, from a Linux PC.
-# Stopgap for dev cards until the setup hotspot exists.
+# For dev cards (or if you'd rather not use the box's setup hotspot).
 #
 # 1. Plug the flashed card in; the desktop mounts its "data" partition
 #    (usually at /media/$USER/data).
@@ -36,7 +36,8 @@ if [ -z "${ssid}" ]; then
 	echo
 fi
 [ -n "${ssid}" ] || { echo "Network name can't be empty." >&2; exit 1; }
-[ "${#password}" -ge 8 ] || { echo "WPA passwords are at least 8 characters." >&2; exit 1; }
+[ "${#password}" -ge 8 ] && [ "${#password}" -le 63 ] ||
+	{ echo "WPA passwords have 8 to 63 characters." >&2; exit 1; }
 
 # iwd names the file after the SSID, hex-encoded if it has unusual characters
 if [[ "${ssid}" =~ ^[A-Za-z0-9_\ -]+$ ]]; then
@@ -47,6 +48,10 @@ fi
 
 install -d -m 0700 "${DATA}/iwd"
 umask 077
-printf '[Security]\nPassphrase=%s\n' "${password}" > "${DATA}/iwd/${name}.psk"
+# iwd's settings format: backslashes doubled, leading spaces written as \s
+value="${password//\\/\\\\}"
+lead="${value%%[! ]*}"
+value="${lead// /\\s}${value#"${lead}"}"
+printf '[Security]\nPassphrase=%s\n' "${value}" > "${DATA}/iwd/${name}.psk"
 sync
 echo "Saved Wi-Fi \"${ssid}\"."

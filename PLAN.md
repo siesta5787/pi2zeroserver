@@ -14,8 +14,8 @@ reflashing, no terminal. Flashing the SD card is the hardest step.
   its own health check and rollback. A known-good fallback copy ships in the rootfs.
 - **Agent** (static Rust, in the read-only rootfs) is the front door on :80. It serves
   `/_system/*` (setup, updates, Wi-Fi, status) and proxies everything else to the app.
-- **Setup:** flash → power on → join `Setup-XXXX` from a phone → pick Wi-Fi, set
-  password → "Connect Tailscale" (QR code).
+- **Setup:** flash → power on → join `Box-Setup-XXXX` (password `boxsetup`) from
+  a phone → set the admin password, pick Wi-Fi → "Connect Tailscale" (link + QR code).
 - **Security:** only the web port is open, no SSH in release builds, no default
   passwords, everything signed.
 
@@ -90,17 +90,31 @@ explicit choice.
 ## First-time setup
 
 1. Flash the `.img.xz` with Raspberry Pi Imager (custom repo JSON so it's listed).
-2. No Wi-Fi configured → open, time-limited `Setup-XXXX` AP with a captive portal.
-3. Pick Wi-Fi, set an admin password and a name → device joins the home Wi-Fi.
-4. Page shows `http://box-xxxx.local` and "Connect Tailscale" (QR code login link).
-5. Optional `setup.txt` on the boot partition: read once, moved to `/data`, deleted.
+2. No Wi-Fi saved → the agent switches iwd to access point mode: `Box-Setup-XXXX`
+   (end of the MAC), WPA2 password `boxsetup` (iwd's AP can't run open; the
+   password is fixed and published since the box has no screen or label).
+   networkd gives it 192.168.4.1 and DHCP; the agent answers all DNS with
+   192.168.4.1 and redirects other web requests to `/_system/`, so phones show
+   their "sign in to network" prompt.
+3. Set the admin password (first visit), then Wi-Fi: pick a network from the list
+   (scanned just before the hotspot started; the Pi's brcmfmac can't scan while
+   it's an AP) or type its name. The box leaves the hotspot to join; on failure
+   the hotspot comes straight back with the error.
+4. Back on the home Wi-Fi: `http://box.local/_system/` → "Connect Tailscale" runs
+   `tailscale up` and shows its sign-in link plus a QR code.
+5. Later: optional `setup.txt` on the boot partition; a box name (several boxes on
+   one network would all be `box.local`).
 
-Can't reach Wi-Fi for ~10 min → setup AP comes back while it keeps retrying.
-Factory reset: UI button, or `factory-reset.txt` on the boot partition.
+Offline for 3 min with saved networks → the hotspot comes up for 5 min (15 while
+someone is connected), then the box tries its networks again; it leaves early
+when a scan sees a saved network.
+Still to do: factory reset / forgotten admin password (a file on the boot
+partition, read at boot).
 
 ## Security
 
-- nftables: inbound only TCP 80 from the local subnet, mDNS, and Tailscale. Toggle
+- nftables: inbound only TCP 80 from the local subnet, mDNS, and Tailscale.
+  On the setup hotspot also DHCP (67/udp) and DNS (53/udp). Toggle
   for "Tailscale-only".
 - Tailscale: no subnet router, no exit node, no accept-routes.
 - No SSH or shell services, root locked. The dev build adds SSH (Tailscale only, keys only).
@@ -232,7 +246,16 @@ RPi Server DIstro/          (this folder, git)
      tailnet front (127.0.0.1:8081) published with `tailscale serve --https=443`,
      forwarded with X-Forwarded-Proto: https. QEMU test runs the real
      kid-phone-server 0.18.6 binary.
-6. Onboarding: AP, captive portal, Tailscale QR.
+6. Onboarding.
+   - ✅ 6a: Wi-Fi page (scan, join, forget) through iwd's D-Bus API via `busctl`;
+     passwords written as iwd network files on /data, restored if the join
+     fails (and the box rejoins the network it was on). Setup hotspot with
+     DHCP and captive portal (DNS + redirect), fallback hotspot when offline.
+     "Connect Tailscale" with sign-in link and QR code. QEMU test runs it on
+     three mac80211_hwsim radios (box, home AP, phone).
+     Still to verify on the Pi: iwd AP mode on brcmfmac, phones' captive
+     portal prompts, the Tailscale sign-in with internet.
+   - 6b: factory reset and forgotten-password recovery; box name.
 7. Hardening: firewall, sandboxing, release defconfig (no curl CLI, no HDMI
    console login, release signing key).
 8. Releases: CI pipeline, signed manifest, Imager repo, novice guide.

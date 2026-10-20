@@ -15,6 +15,15 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
     with `tailscale serve --bg --https=443` once Tailscale is connected;
   - `/run/box/api.sock` (root:app 0660): the box API for the app.
   Only `/_system/api/health` is public; localhost gets no special trust.
+- Wi-Fi (`agent/src/wifi.rs`): the agent drives iwd with `busctl --json` (no
+  D-Bus crate). Joining writes the password as an iwd network file in
+  `/data/iwd` and calls `Network.Connect` (no iwd agent). With no saved network,
+  or offline for 3 min, it switches wlan0 to AP mode: `Box-Setup-XXXX`, password
+  `boxsetup`, 192.168.4.1 with networkd's DHCP server (`10-setup-hotspot.network`,
+  matched by `WLANInterfaceType=ap`); `captive_dns.rs` answers every name with
+  192.168.4.1 and the LAN front redirects non-`/_system` requests there.
+- "Connect Tailscale" (`tailscale_login.rs`) runs `tailscale up` and shows the
+  sign-in link and a QR code (qrcode crate, SVG).
 - State on `/data`: `agent/` (admin password), `iwd/`, `tailscale/{state,releases,
   current}`, `rauc/`, `timesync/`, `app/{releases,current,state,run,env,snapshots}`.
 - Activation scripts in `/usr/libexec/box/` do the switch-and-health-check for
@@ -53,8 +62,9 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   - rootfs overlay, `post-build.sh`, `post-image.sh` → plain `./build.sh dev`
   - changed a package's `_DEPENDENCIES` → `<pkg>-dirclean` (`-rebuild` doesn't
     refresh its per-package sysroot, so new libraries stay invisible)
-  - `agent/` sources → `./build.sh dev box-agent-rebuild` (local package; Buildroot
-    re-copies it only on rebuild). Run `cargo fmt`, `cargo clippy --all-targets`
+  - `agent/` sources → `./build.sh dev box-agent-rebuild` and then `./build.sh dev`
+    (local package: Buildroot re-copies it only on rebuild, and `-rebuild` alone
+    may stop after the copy; check `target/usr/bin/box-agent`'s timestamp). Run `cargo fmt`, `cargo clippy --all-targets`
     and `cargo test` in `agent/` first: the agent targets Rust 1.88 (Buildroot's),
     so keep `rust-version` and let Cargo pick compatible crate versions.
 - The project drive is a USB disk. After long builds, check
@@ -68,7 +78,8 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   ~60 checks: first boot on slot A (marked good, read-only root, /data grown),
   agent login and APIs, Tailscale activate/rollback, a power cut, the real
   kid-phone-server binary (fetched from GitHub on this machine) with a broken
-  update rolled back, a signed OS install into slot B through the agent, and
+  update rolled back, the setup hotspot and Wi-Fi joins on three
+  `mac80211_hwsim` radios (box, "home" AP, "phone"), a signed OS install into slot B through the agent, and
   rollback from a broken B. Run it after anything touching boot, U-Boot, RAUC,
   the kernel, systemd units or the agent. It takes ~25 min: launch it detached
   like a build. Its docstring lists the QEMU-only adaptations (U-Boot image
@@ -135,6 +146,17 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   the `curl` command for tests and debugging (to be dropped from release images).
 - The tar crate skips archive entries with `..` instead of failing; nothing
   escapes, but don't rely on an error to detect hostile archives.
+- iwd: after a failed handshake (wrong password) the next `Network.Connect` on
+  that network asks an agent for the password and fails with "No Agent
+  registered"; retrying once works. iwd also won't auto-rejoin that network, so
+  after a failed join the agent reconnects to the previous one explicitly.
+  `Network.Connect` on the network it's already on returns success without
+  trying anything, so a new password for the current network needs a
+  `Station.Disconnect` first (else a typo gets saved as "joined").
+- iwd's access point mode needs a WPA2 password (no open hotspots), and the
+  Pi's brcmfmac can't scan in AP mode (mac80211 drivers, e.g. the QEMU test's
+  hwsim radios, can): the network list comes from a scan just before the
+  hotspot starts.
 - No RTC: `/usr/lib/clock-epoch` (stamped in `post-build.sh`) keeps the clock at
   least at build time, or offline devices reject bundle signatures.
 

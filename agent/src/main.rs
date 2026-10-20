@@ -1,9 +1,11 @@
 //! box-agent: the appliance's front door on port 80.
 //!
 //! - `/_system/...`: system pages and JSON API, behind the admin password
-//!   (see auth.rs). Status for now; updates, Wi-Fi and setup come later.
-//! - everything else is proxied to the user's app on 127.0.0.1:8080, with a
-//!   friendly page when the app isn't answering
+//!   (see auth.rs): status, updates, Wi-Fi, Tailscale sign-in
+//! - on the tailnet front, everything else is proxied to the user's app, with
+//!   a friendly page when the app isn't answering; the home network gets a
+//!   pointer to the app's Tailscale address instead (or, on the setup
+//!   hotspot, a redirect to the setup page)
 //!
 //! It lives in the read-only OS image and only changes with OS updates, so a
 //! bad app update can never take away the page used to fix it.
@@ -11,6 +13,7 @@
 mod app_update;
 mod auth;
 mod box_api;
+mod captive_dns;
 mod http;
 mod manifest;
 mod os_update;
@@ -18,8 +21,10 @@ mod pages;
 mod progress;
 mod proxy;
 mod status;
+mod tailscale_login;
 mod tailscale_serve;
 mod tailscale_update;
+mod wifi;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -41,6 +46,8 @@ struct AppState {
     manifests: manifest::Manifests,
     app_update: app_update::AppUpdate,
     tailscale_serve: tailscale_serve::Shared,
+    tailscale_login: tailscale_login::TailscaleLogin,
+    wifi: wifi::Wifi,
     /// Command that restarts the box (replaced in tests)
     reboot: Arc<Vec<String>>,
 }
@@ -59,6 +66,8 @@ impl AppState {
             app_update: app_update::AppUpdate::new(app_update::Config::device()),
             tailscale_serve: Default::default(),
             tailscale_update: tailscale_update::TailscaleUpdate::new(tailscale_update::Config::device()),
+            tailscale_login: tailscale_login::TailscaleLogin::new("tailscale"),
+            wifi: wifi::Wifi::new(wifi::Config::device()),
             reboot: Arc::new(vec!["systemctl".into(), "reboot".into()]),
         }
     }
@@ -130,6 +139,13 @@ fn router(state: AppState, front: Front) -> Router {
         .route("/_system/api/app/update", get(app_update_state).post(app_update_api))
         .route("/_system/api/tailscale/update", get(tailscale_update_state).post(tailscale_update_api))
         .route("/_system/tailscale/update", post(tailscale_update_form))
+        .route("/_system/tailscale/login", post(tailscale_login_form))
+        .route("/_system/api/tailscale/login", get(tailscale_login_state))
+        .route("/_system/wifi", get(wifi_page))
+        .route("/_system/wifi/join", post(wifi_join))
+        .route("/_system/wifi/forget", post(wifi_forget))
+        .route("/_system/wifi/scan", post(wifi_scan))
+        .route("/_system/api/wifi", get(wifi_state))
         // Unknown system paths stay with the agent rather than reaching the app
         .route("/_system/{*rest}", any(|| async { StatusCode::NOT_FOUND }))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard));
@@ -140,9 +156,14 @@ fn router(state: AppState, front: Front) -> Router {
     Router::new().merge(system).merge(app).with_state(state)
 }
 
-async fn app_on_tailnet() -> impl IntoResponse {
+async fn app_on_tailnet(State(state): State<AppState>) -> Response {
+    if state.wifi.hotspot_active() {
+        // Captive portal: phones checking for internet land on the setup page
+        let setup = format!("http://{}/_system/", wifi::HOTSPOT_ADDRESS);
+        return (StatusCode::FOUND, [(header::LOCATION, setup)]).into_response();
+    }
     let s = status::gather().await;
-    Html(pages::app_on_tailnet(s.tailscale.dns_name.as_deref()))
+    Html(pages::app_on_tailnet(s.tailscale.dns_name.as_deref())).into_response()
 }
 
 async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
@@ -155,6 +176,7 @@ async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
     let (app_installed, app_initial_password) =
         (state.app_update.installed_version(), state.app_update.initial_admin_password());
     let serve = state.tailscale_serve.lock().unwrap().clone();
+    let (login, wifi) = (state.tailscale_login.state(), state.wifi.view());
     let updates = pages::Updates {
         install: &install,
         tailscale: &tailscale,
@@ -164,6 +186,8 @@ async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
         app_installed: app_installed.as_deref(),
         app_initial_password: app_initial_password.as_deref(),
         serve: &serve,
+        login: &login,
+        wifi: &wifi,
     };
     Html(pages::status(&status::gather().await, &updates))
 }
@@ -300,7 +324,61 @@ async fn tailscale_update_form(State(state): State<AppState>) -> Redirect {
     Redirect::to("/_system/")
 }
 
-/// Restarts the box shortly after answering, so the page still arrives.
+async fn tailscale_login_form(State(state): State<AppState>) -> Redirect {
+    state.tailscale_login.start();
+    Redirect::to("/_system/")
+}
+
+async fn tailscale_login_state(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.tailscale_login.state())
+}
+
+async fn wifi_page(State(state): State<AppState>) -> impl IntoResponse {
+    Html(pages::wifi(&state.wifi.view(), None))
+}
+
+async fn wifi_state(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.wifi.view())
+}
+
+#[derive(Deserialize)]
+struct JoinForm {
+    ssid: String,
+    #[serde(default)]
+    password: String,
+}
+
+async fn wifi_join(State(state): State<AppState>, Form(form): Form<JoinForm>) -> Response {
+    let leaving_hotspot = state.wifi.hotspot_active();
+    let problem = match state.wifi.join(form.ssid.clone(), form.password) {
+        Ok(()) if leaving_hotspot => return Html(pages::wifi_leaving(&form.ssid)).into_response(),
+        Ok(()) => return Redirect::to("/_system/wifi").into_response(),
+        Err(wifi::JoinError::Busy) => (StatusCode::CONFLICT, "The box is already joining a network."),
+        Err(wifi::JoinError::BadName) => (StatusCode::BAD_REQUEST, "That isn't a Wi-Fi network name."),
+        Err(wifi::JoinError::BadPassword) => {
+            (StatusCode::BAD_REQUEST, "Wi-Fi passwords have 8 to 63 characters (letters, numbers, symbols).")
+        }
+    };
+    (problem.0, Html(pages::wifi(&state.wifi.view(), Some(problem.1)))).into_response()
+}
+
+#[derive(Deserialize)]
+struct ForgetForm {
+    name: String,
+}
+
+async fn wifi_forget(State(state): State<AppState>, Form(form): Form<ForgetForm>) -> Response {
+    match state.wifi.forget(&form.name).await {
+        Ok(()) => Redirect::to("/_system/wifi").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Html(pages::wifi(&state.wifi.view(), Some(&e)))).into_response(),
+    }
+}
+
+async fn wifi_scan(State(state): State<AppState>) -> Redirect {
+    state.wifi.scan();
+    Redirect::to("/_system/wifi")
+}
+
 /// Restarts the box a second from now, so the caller still gets its answer.
 fn schedule_restart(state: &AppState) {
     let cmd = state.reboot.clone();
@@ -415,6 +493,8 @@ async fn main() {
     let state = AppState::new(args.app, args.data_dir);
     state.manifests.spawn_periodic();
     spawn_first_app_install(state.clone());
+    state.wifi.spawn();
+    captive_dns::spawn(wifi::HOTSPOT_ADDRESS);
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -475,6 +555,9 @@ mod tests {
     pub(crate) fn test_state(dir: &std::path::Path) -> AppState {
         let mut state = AppState::new("127.0.0.1:9".parse().unwrap(), dir.to_owned());
         state.reboot = Arc::new(vec!["true".into()]);
+        // No iwd or Tailscale of this machine's
+        state.wifi = wifi::Wifi::new(wifi::Config { busctl: "false".into(), ..wifi::Config::device() });
+        state.tailscale_login = tailscale_login::TailscaleLogin::new("false");
         state
     }
 
@@ -484,11 +567,17 @@ mod tests {
     }
 
     async fn start_front(app: SocketAddr, front: Front) -> Agent {
+        start_with_wifi(app, front, wifi::View::default()).await
+    }
+
+    /// An agent whose Wi-Fi looks like `wifi`
+    async fn start_with_wifi(app: SocketAddr, front: Front, wifi: wifi::View) -> Agent {
         let data = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut state = test_state(data.path());
         state.proxy = proxy::Proxy::new(app);
+        state.wifi.set_view(wifi);
         let service = router(state, front).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
         Agent { addr, _data: data }
@@ -740,6 +829,75 @@ mod tests {
         assert_eq!(r.status, StatusCode::BAD_GATEWAY);
         assert!(r.headers.get("content-type").unwrap().to_str().unwrap().starts_with("text/html"));
         assert!(r.body.contains("/_system/"), "page links to the system page: {}", r.body);
+    }
+
+    fn hotspot_view() -> wifi::View {
+        wifi::View {
+            available: true,
+            hotspot: Some(wifi::Hotspot {
+                ssid: "Box-Setup-ABCD".into(),
+                password: "boxsetup".into(),
+                setup: true,
+            }),
+            networks: vec![wifi::Visible {
+                name: "Home <5G>".into(),
+                kind: "psk".into(),
+                signal: -55,
+                saved: false,
+                connected: false,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_hotspot_sends_phones_to_the_setup_page() {
+        let lan = start_with_wifi(unused_port().await, Front::Lan, hotspot_view()).await;
+        // What Android and iOS fetch to see whether the network has internet
+        for path in ["/generate_204", "/hotspot-detect.html"] {
+            let r = fetch(&lan, path, None).await;
+            assert_eq!(
+                (r.status, r.location()),
+                (StatusCode::FOUND, "http://192.168.4.1/_system/"),
+                "{path}"
+            );
+        }
+        assert_eq!(fetch(&lan, "/_system/api/health", None).await.body, "ok");
+        // Without the hotspot, the home network gets the pointer to Tailscale
+        let home = start_front(unused_port().await, Front::Lan).await;
+        assert_eq!(fetch(&home, "/generate_204", None).await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn wifi_setup_needs_the_password_and_checks_input() {
+        let lan = start_with_wifi(unused_port().await, Front::Lan, hotspot_view()).await;
+        // First the admin password, then everything else
+        assert_eq!(fetch(&lan, "/_system/wifi", None).await.location(), "/_system/password");
+        let cookie = set_up(&lan).await;
+        let r = fetch(&lan, "/_system/", Some(&cookie)).await;
+        assert!(r.body.contains("isn't on your Wi-Fi yet") && r.body.contains("/_system/wifi"), "{}", r.body);
+        assert!(
+            r.body.contains("Connect the box to your Wi-Fi first"),
+            "no Tailscale sign-in without internet"
+        );
+        let r = fetch(&lan, "/_system/wifi", Some(&cookie)).await;
+        assert!(r.body.contains("Home &lt;5G&gt;") && r.body.contains("Box-Setup-ABCD"), "{}", r.body);
+        let r = fetch(&lan, "/_system/api/wifi", Some(&cookie)).await;
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["hotspot"]["ssid"], "Box-Setup-ABCD");
+
+        let r = submit(&lan, "/_system/wifi/join", Some(&cookie), "ssid=Home&password=short").await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        assert!(r.body.contains("8 to 63 characters"));
+        let r = submit(&lan, "/_system/wifi/join", Some(&cookie), "ssid=&password=").await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        // A real join leaves the hotspot: the page says what to do next
+        let r = submit(&lan, "/_system/wifi/join", Some(&cookie), "ssid=Home+%3C5G%3E&password=long+enough")
+            .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert!(r.body.contains("Connect this phone back to <b>Home &lt;5G&gt;</b>"), "{}", r.body);
+        let r = submit(&lan, "/_system/wifi/join", Some(&cookie), "ssid=Other&password=long+enough").await;
+        assert_eq!(r.status, StatusCode::CONFLICT, "one join at a time");
     }
 
     #[tokio::test]

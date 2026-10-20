@@ -1,0 +1,21 @@
+# The setup hotspot (iwd in access point mode, started by box-agent): the box
+# is 192.168.4.1 and hands out addresses. box-agent answers DNS on that address
+# with itself, so phones open the setup page. Keep the address in sync with
+# HOTSPOT_ADDRESS in agent/src/wifi.rs.
+[Match]
+Name=wlan0
+WLANInterfaceType=ap
+
+[Network]
+Address=192.168.4.1/24
+DHCPServer=yes
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+MulticastDNS=no
+LLMNR=no
+
+[DHCPServer]
+PoolOffset=10
+PoolSize=100
+EmitDNS=yes
+DNS=192.168.4.1

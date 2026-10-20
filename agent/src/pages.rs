@@ -5,7 +5,9 @@ use std::fmt::Write;
 use crate::manifest::{Check, os_newer};
 use crate::os_update::Install;
 use crate::progress::Progress;
-use crate::status::Status;
+use crate::status::{Status, Tailscale};
+use crate::tailscale_login::Login;
+use crate::wifi;
 
 /// Everything besides `Status` that the status page shows: update jobs, and
 /// whether the app is published over Tailscale
@@ -20,6 +22,8 @@ pub struct Updates<'a> {
     pub app_installed: Option<&'a str>,
     /// The generated first-login password, until dismissed
     pub app_initial_password: Option<&'a str>,
+    pub login: &'a Login,
+    pub wifi: &'a wifi::View,
 }
 
 /// Escapes text for HTML element content and attribute values.
@@ -221,8 +225,181 @@ fn tailscale_update_line(update: &Progress) -> String {
     }
 }
 
+fn signal_words(dbm: i32) -> &'static str {
+    match dbm {
+        -60.. => "strong signal",
+        -72.. => "good signal",
+        _ => "weak signal",
+    }
+}
+
+fn join_line(join: &wifi::Join) -> String {
+    match join {
+        wifi::Join::Idle => String::new(),
+        wifi::Join::Joining { ssid } => format!("<p class=\"warn\">Joining <b>{}</b>…</p>", esc(ssid)),
+        wifi::Join::Joined { ssid } => format!("<p class=\"ok\">Joined <b>{}</b>.</p>", esc(ssid)),
+        wifi::Join::Failed { error, .. } => format!("<p class=\"warn\" role=\"alert\">{}</p>", esc(error)),
+    }
+}
+
+/// The status page's Wi-Fi summary; the setup prompt while the hotspot is on
+fn wifi_section(w: &wifi::View) -> String {
+    let body = match (&w.hotspot, &w.connected) {
+        (Some(h), _) => format!(
+            "<p class=\"warn\">{}</p><p><a href=\"/_system/wifi\"><b>Choose your Wi-Fi network</b></a></p>",
+            if h.setup {
+                "The box isn't on your Wi-Fi yet."
+            } else {
+                "The box couldn't reach your Wi-Fi, so it opened its setup hotspot. It keeps trying your saved networks."
+            }
+        ),
+        _ if !w.available => "<p class=\"muted\">No Wi-Fi found on this box.</p>".to_owned(),
+        (None, Some(name)) => format!(
+            "<p class=\"ok\">Connected to <b>{}</b></p><p><a href=\"/_system/wifi\">Change Wi-Fi</a></p>",
+            esc(name)
+        ),
+        (None, None) => {
+            "<p class=\"warn\">Not connected.</p><p><a href=\"/_system/wifi\">Choose a Wi-Fi network</a></p>"
+                .to_owned()
+        }
+    };
+    format!("<section><h2>Wi-Fi</h2>{}{body}</section>", join_line(&w.join))
+}
+
+/// The Wi-Fi page: networks nearby, joining, saved networks
+pub fn wifi(w: &wifi::View, error: Option<&str>) -> String {
+    let mut b = String::from("<h1>Wi-Fi</h1>");
+    b.push_str(&error_line(error));
+    if let Some(h) = &w.hotspot {
+        let _ = write!(
+            b,
+            "<p>Pick your home Wi-Fi network and enter its password. The box then leaves its \
+             setup hotspot (<b>{}</b>) and joins your network.</p>",
+            esc(&h.ssid)
+        );
+    } else if let Some(name) = &w.connected {
+        let _ = write!(b, "<p class=\"ok\">The box is on <b>{}</b>.</p>", esc(name));
+    }
+    b.push_str(&join_line(&w.join));
+
+    b.push_str("<section><h2>Networks nearby</h2>");
+    if w.networks.is_empty() {
+        b.push_str("<p class=\"muted\">No networks found yet.</p>");
+    }
+    for n in &w.networks {
+        let mut notes = vec![signal_words(n.signal)];
+        if n.connected {
+            notes.push("connected");
+        } else if n.saved {
+            notes.push("saved");
+        }
+        let label = format!("<b>{}</b> <span class=\"muted\">{}</span>", esc(&n.name), notes.join(" · "));
+        let password = match n.kind.as_str() {
+            "open" => {
+                "<p class=\"muted\">No password (anyone nearby can see what's sent on it).</p>".to_owned()
+            }
+            "psk" => format!(
+                "<p><label>Password{}<br><input type=\"password\" name=\"password\" minlength=\"8\" \
+                 maxlength=\"63\" autocomplete=\"off\"{}></label></p>",
+                if n.saved { " (leave empty to use the saved one)" } else { "" },
+                if n.saved { "" } else { " required" }
+            ),
+            _ => {
+                let _ = write!(
+                    b,
+                    "<p>{label}<br><span class=\"muted\">Uses enterprise sign-in, which the box doesn't support.</span></p>"
+                );
+                continue;
+            }
+        };
+        let _ = write!(
+            b,
+            "<details><summary>{label}</summary><form method=\"post\" action=\"/_system/wifi/join\">\
+             <input type=\"hidden\" name=\"ssid\" value=\"{}\">{password}<p><button>Join</button></p></form></details>",
+            esc(&n.name)
+        );
+    }
+    b.push_str(
+        "<form method=\"post\" action=\"/_system/wifi/scan\"><p><button>Look again</button></p></form>\
+         <details><summary>Network not listed?</summary><form method=\"post\" action=\"/_system/wifi/join\">\
+         <p><label>Network name<br><input name=\"ssid\" maxlength=\"32\" required autocapitalize=\"off\"></label></p>\
+         <p><label>Password (empty if it has none)<br><input type=\"password\" name=\"password\" \
+         maxlength=\"63\" autocomplete=\"off\"></label></p><p><button>Join</button></p></form></details></section>",
+    );
+
+    if !w.saved.is_empty() {
+        b.push_str("<section><h2>Saved networks</h2><p class=\"muted\">The box joins these by itself when they're in range.</p>");
+        for name in &w.saved {
+            let current = w.connected.as_deref() == Some(name.as_str());
+            let _ = write!(
+                b,
+                "<form method=\"post\" action=\"/_system/wifi/forget\"><p><b>{0}</b> \
+                 <input type=\"hidden\" name=\"name\" value=\"{0}\"><button>Forget</button>{1}</p></form>",
+                esc(name),
+                if current {
+                    " <span class=\"muted\">(the box is on it now and will disconnect)</span>"
+                } else {
+                    ""
+                }
+            );
+        }
+        b.push_str("</section>");
+    }
+    b.push_str("<p><a href=\"/_system/\">Back</a></p>");
+    let busy = matches!(w.join, wifi::Join::Joining { .. }) || w.scanning;
+    page_refreshing("Wi-Fi", &b, busy.then_some((3, "/_system/wifi")))
+}
+
+/// After choosing a network from the setup hotspot, which is about to go away
+pub fn wifi_leaving(ssid: &str) -> String {
+    let ssid = esc(ssid);
+    page(
+        "Joining your Wi-Fi",
+        &format!(
+            "<h1>Joining {ssid}…</h1><p>The box is leaving its setup hotspot to join <b>{ssid}</b>, \
+             so this page will lose its connection. Next:</p>\
+             <ol><li>Connect this phone back to <b>{ssid}</b>.</li>\
+             <li>Open <a href=\"http://box.local/_system/\">http://box.local/_system/</a> \
+             and bookmark it.</li></ol>\
+             <p class=\"muted\">If the box can't join (say, the password was wrong), its setup hotspot \
+             comes back within a couple of minutes: connect to it again to see what went wrong.</p>\
+             <p class=\"muted\">If box.local doesn't open (some Android phones can't use .local names), \
+             look for \"box\" in your router's list of devices and open its address instead.</p>"
+        ),
+    )
+}
+
+/// The Tailscale section's sign-in part, while Tailscale isn't connected
+fn tailscale_connect(ts: &Tailscale, u: &Updates) -> String {
+    let signed_out = matches!(ts.backend_state.as_deref(), Some("NeedsLogin" | "NoState" | "Stopped"));
+    let button = "<p>Tailscale lets your own devices reach the app securely from anywhere. \
+                  You'll need a (free) Tailscale account.</p>\
+                  <form method=\"post\" action=\"/_system/tailscale/login\"><button>Connect Tailscale</button></form>";
+    match u.login {
+        Login::Starting => "<p class=\"muted\">Getting a sign-in link from Tailscale…</p>".to_owned(),
+        Login::Waiting { url } => format!(
+            "<p>Sign in to Tailscale to add the box to your devices:</p>\
+             <p><a href=\"{0}\" target=\"_blank\" rel=\"noopener\"><b>Sign in to Tailscale</b></a></p>\
+             <p class=\"muted\">Or scan this with another phone or tablet:</p>{1}\
+             <p class=\"muted\">This page updates by itself once you've signed in.</p>",
+            esc(url),
+            crate::tailscale_login::qr_svg(url)
+                .map(|svg| format!("<div style=\"max-width:240px\">{svg}</div>"))
+                .unwrap_or_default()
+        ),
+        _ if ts.running && !signed_out => String::new(),
+        _ if u.wifi.hotspot.is_some() => {
+            "<p class=\"muted\">Connect the box to your Wi-Fi first.</p>".to_owned()
+        }
+        _ if !ts.running => String::new(),
+        Login::Failed { error } => format!("<p class=\"warn\">Couldn't connect: {}</p>{button}", esc(error)),
+        Login::Idle => button.to_owned(),
+    }
+}
+
 pub fn status(s: &Status, updates: &Updates) -> String {
     let mut b = String::from("<h1>Box</h1>");
+    b.push_str(&wifi_section(updates.wifi));
 
     // System
     let backup = s.os.slots.iter().find(|slot| Some(&slot.name) != s.os.booted_slot.as_ref());
@@ -255,7 +432,8 @@ pub fn status(s: &Status, updates: &Updates) -> String {
     let _ = write!(
         b,
         "<section><h2>Remote access (Tailscale)</h2><p class=\"{class}\">{line}</p>\
-         <p class=\"muted\">Version {}</p>{}</section>",
+         {}<p class=\"muted\">Version {}</p>{}</section>",
+        tailscale_connect(ts, updates),
         esc(ts.version.as_deref().unwrap_or("unknown")),
         tailscale_update_line(updates.tailscale),
     );
@@ -287,11 +465,14 @@ pub fn status(s: &Status, updates: &Updates) -> String {
     let busy = matches!(updates.install, Install::Running { .. })
         || updates.manifest.checking
         || updates.app.busy()
+        || matches!(updates.wifi.join, wifi::Join::Joining { .. })
         || matches!(
             updates.tailscale,
             Progress::Checking | Progress::Downloading { .. } | Progress::Installing { .. }
         );
-    let refresh = busy.then_some((3, "/_system/"));
+    // Waiting for a Tailscale sign-in: refresh gently, the user is busy on another page
+    let refresh =
+        if busy { Some((3, "/_system/")) } else { updates.login.busy().then_some((5, "/_system/")) };
     page_refreshing("Box", &b, refresh)
 }
 
@@ -423,6 +604,8 @@ mod tests {
                 app_installed: None,
                 app_initial_password: None,
                 serve: &Default::default(),
+                login: &Login::Idle,
+                wifi: &Default::default(),
             },
         );
         assert!(!html.contains("<script>") && html.contains("&lt;script&gt;"));
@@ -442,6 +625,8 @@ mod tests {
             app_installed: None,
             app_initial_password: None,
             serve: &Default::default(),
+            login: &Login::Idle,
+            wifi: &Default::default(),
         };
         update_section(&u, "2026.10.19.2244-g77ccad4")
     }
@@ -512,6 +697,8 @@ mod tests {
             app_installed: installed,
             app_initial_password: password,
             serve: Box::leak(Box::new(crate::tailscale_serve::Serve { configured: true, error: None })),
+            login: &Login::Idle,
+            wifi: Box::leak(Box::new(wifi::View::default())),
         };
         let html = app_section(&status(Some("box.tail1.ts.net")), &updates(Some("0.18.6"), Some("Ab<c")));
         assert!(html.contains("0.18.6 is running") && html.contains("An app update is available: 0.19.0"));
