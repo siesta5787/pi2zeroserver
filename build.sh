@@ -72,6 +72,23 @@ if [ -z "${BOX_RAUC_KEY:-}" ]; then
 fi
 export BOX_RAUC_KEY BOX_RAUC_CERT="${BOX_RAUC_CERT:?set BOX_RAUC_CERT with BOX_RAUC_KEY}"
 
+# Release manifest signing key (Ed25519). Devices trust the public half baked
+# into their image; tools/publish-release.sh signs with the private half.
+if [ -z "${BOX_MANIFEST_KEY:-}" ]; then
+	BOX_MANIFEST_KEY="${PROJECT_DIR}/local/manifest/${VARIANT}-key.pem"
+	if [ ! -f "${BOX_MANIFEST_KEY}" ]; then
+		[ "${VARIANT}" = dev ] || {
+			echo "No release manifest key: set BOX_MANIFEST_KEY" >&2; exit 1; }
+		mkdir -p "${PROJECT_DIR}/local/manifest"
+		openssl genpkey -algorithm ed25519 -out "${BOX_MANIFEST_KEY}"
+		chmod 0600 "${BOX_MANIFEST_KEY}"
+	fi
+fi
+# base64 of the raw 32-byte public key: the last 32 bytes of its DER form
+BOX_MANIFEST_PUB="$(openssl pkey -in "${BOX_MANIFEST_KEY}" -pubout -outform DER | tail -c 32 | base64)"
+export BOX_MANIFEST_KEY BOX_MANIFEST_PUB
+export BOX_MANIFEST_URL="${BOX_MANIFEST_URL:-https://github.com/siesta5787/pi2zeroserver/releases/latest/download/manifest.json}"
+
 OUT="${BUILD_ROOT}/output/${VARIANT}"
 MAKE=(make -C "${BUILD_ROOT}/buildroot" O="${OUT}" BR2_EXTERNAL="${BUILD_ROOT}/br2-external")
 

@@ -9,6 +9,8 @@
 //! bad app update can never take away the page used to fix it.
 
 mod auth;
+mod http;
+mod manifest;
 mod os_update;
 mod pages;
 mod proxy;
@@ -32,6 +34,7 @@ struct AppState {
     auth: Arc<auth::Auth>,
     os_update: os_update::OsUpdate,
     tailscale_update: tailscale_update::TailscaleUpdate,
+    manifests: manifest::Manifests,
     /// Command that restarts the box (replaced in tests)
     reboot: Arc<Vec<String>>,
 }
@@ -46,6 +49,7 @@ impl AppState {
                 data_dir.starts_with("/data").then(|| PathBuf::from("/data")),
             )),
             os_update: os_update::OsUpdate::new("rauc".into()),
+            manifests: manifest::Manifests::new(manifest::Config::device()),
             tailscale_update: tailscale_update::TailscaleUpdate::new(tailscale_update::Config::device()),
             reboot: Arc::new(vec!["systemctl".into(), "reboot".into()]),
         }
@@ -92,6 +96,10 @@ fn router(state: AppState) -> Router {
         .route("/_system/api/os/install", get(os_install_state).post(os_install_api))
         .route("/_system/os/install", post(os_install_form))
         .route("/_system/restart", post(restart))
+        .route("/_system/check", post(check_form))
+        .route("/_system/os/update", post(os_update_form))
+        .route("/_system/api/updates", get(updates_state))
+        .route("/_system/api/updates/check", post(check_api))
         .route("/_system/api/tailscale/update", get(tailscale_update_state).post(tailscale_update_api))
         .route("/_system/tailscale/update", post(tailscale_update_form))
         // Unknown system paths stay with the agent rather than reaching the app
@@ -101,7 +109,15 @@ fn router(state: AppState) -> Router {
 }
 
 async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
-    Html(pages::status(&status::gather().await, &state.os_update.state(), &state.tailscale_update.state()))
+    let (install, tailscale, manifest) =
+        (state.os_update.state(), state.tailscale_update.state(), state.manifests.state());
+    let updates = pages::Updates {
+        install: &install,
+        tailscale: &tailscale,
+        manifest: &manifest,
+        checks_configured: state.manifests.configured(),
+    };
+    Html(pages::status(&status::gather().await, &updates))
 }
 
 async fn status_json() -> impl IntoResponse {
@@ -126,6 +142,36 @@ async fn os_install_api(State(state): State<AppState>, Form(form): Form<InstallF
         }
         Err(os_update::StartError::BadSource) => {
             (StatusCode::BAD_REQUEST, "not an update address").into_response()
+        }
+    }
+}
+
+async fn check_form(State(state): State<AppState>) -> Redirect {
+    state.manifests.check_now();
+    Redirect::to("/_system/")
+}
+
+async fn check_api(State(state): State<AppState>) -> Response {
+    let status = if state.manifests.check_now() { StatusCode::ACCEPTED } else { StatusCode::CONFLICT };
+    (status, axum::Json(state.manifests.state())).into_response()
+}
+
+async fn updates_state(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.manifests.state())
+}
+
+/// Installs the OS release the manifest names
+async fn os_update_form(State(state): State<AppState>) -> Response {
+    let bundle = state.manifests.state().latest.and_then(|m| m.os).map(|os| os.bundle_url);
+    match bundle {
+        Some(url) => {
+            // Already installing counts too: the page shows the progress
+            let _ = state.os_update.start(&url);
+            Redirect::to("/_system/").into_response()
+        }
+        None => {
+            let page = pages::message("No update", "There's no update to install right now.");
+            (StatusCode::CONFLICT, Html(page)).into_response()
         }
     }
 }
@@ -264,6 +310,7 @@ async fn main() {
         }
     };
     let state = AppState::new(args.app, args.data_dir);
+    state.manifests.spawn_periodic();
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
         Ok(l) => l,
         Err(e) => {

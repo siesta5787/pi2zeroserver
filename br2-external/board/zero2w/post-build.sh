@@ -21,6 +21,11 @@ install -D -m 0644 "${BOX_RAUC_CERT}" "${TARGET}/etc/rauc/keyring.pem"
 
 echo "${BOX_VERSION}" > "${TARGET}/etc/box-version"
 
+# Where to look for updates, and the key their manifest must be signed with
+install -d -m 0755 "${TARGET}/etc/box"
+echo "${BOX_MANIFEST_URL}" > "${TARGET}/etc/box/manifest-url"
+echo "${BOX_MANIFEST_PUB}" > "${TARGET}/etc/box/manifest-key.pub"
+
 # No RTC on the Pi: systemd never sets the clock earlier than this file's
 # mtime, so the clock starts at least at build time. Without this, a boot with
 # no network sits in the past and update signatures look "not yet valid".

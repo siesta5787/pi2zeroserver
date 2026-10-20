@@ -218,8 +218,13 @@ RPi Server DIstro/          (this folder, git)
      fails if the agent doesn't link it) with ca-certificates. Verified against
      Tailscale's real key chain in tests; QEMU checks it runs and fails cleanly
      offline. Still to verify on the Pi with internet.
-   - 5c: signed update manifest + "update available" (needs: where releases
-     are hosted); 5f: app releases with activate/rollback
+   - ✅ 5c: signed release manifest. Agent checks
+     `releases/latest/download/manifest.json` (+ `.sig`, Ed25519, key pinned in
+     /etc/box) a minute after boot and every ~12 h, shows "system update
+     available" with an Install button. `tools/publish-release.sh` builds, signs
+     and publishes it (pinning a kid-phone-server release by SHA-256).
+   - 5f: app releases with activate/rollback; box API socket; tailnet listener
+     + tailscale serve
 6. Onboarding: AP, captive portal, Tailscale QR.
 7. Hardening: firewall, sandboxing, release defconfig (no curl CLI, no HDMI
    console login, release signing key).

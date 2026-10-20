@@ -369,6 +369,22 @@ def check_agent(con, slot):
             time.sleep(5)
         # ...and with a network error: "Unsupported protocol" would mean curl lacks HTTPS
         error = state.get("error", "")
+        rc, out = con.sh("cat /etc/box/manifest-url /etc/box/manifest-key.pub", check=False)
+        check("image knows where updates come from", rc == 0 and "releases/latest/download/manifest.json" in out,
+              out.splitlines()[0] if out else "")
+        agent_api(con, "/_system/api/updates/check", cookie, "")
+        updates = {}
+        for _ in range(30):
+            code, body = agent_api(con, "/_system/api/updates", cookie)
+            try:
+                updates = json.loads(body.splitlines()[-1])
+            except (ValueError, IndexError):
+                updates = {}
+            if not updates.get("checking"):
+                break
+            time.sleep(5)
+        check("update check fails cleanly offline", "github.com" in (updates.get("error") or "")
+              and "Unsupported protocol" not in updates.get("error", ""), str(updates))
         check("Tailscale updater fails cleanly offline",
               state.get("state") == "failed" and "pkgs.tailscale.com" in error
               and "Unsupported protocol" not in error, str(state))

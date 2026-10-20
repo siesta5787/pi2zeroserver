@@ -2,9 +2,19 @@
 
 use std::fmt::Write;
 
+use crate::manifest::{Check, os_newer};
 use crate::os_update::Install;
 use crate::status::Status;
 use crate::tailscale_update::Update;
+
+/// Everything about updates the status page shows
+pub struct Updates<'a> {
+    pub install: &'a Install,
+    pub tailscale: &'a Update,
+    pub manifest: &'a Check,
+    /// False if this image has no manifest address/key
+    pub checks_configured: bool,
+}
 
 /// Escapes text for HTML element content and attribute values.
 pub fn esc(s: &str) -> String {
@@ -60,8 +70,8 @@ fn duration(seconds: u64) -> String {
     }
 }
 
-fn update_section(install: &Install) -> String {
-    let body = match install {
+fn update_section(u: &Updates, running: &str) -> String {
+    let body = match u.install {
         Install::Running { percent, step } => format!(
             "<p class=\"warn\">Installing an update: {percent}%</p><p class=\"muted\">{}</p>\
              <p>You can keep using the app. The box restarts when you say so.</p>",
@@ -70,14 +80,20 @@ fn update_section(install: &Install) -> String {
         Install::Installed => "<p class=\"ok\">An update is installed. Restart to start using it.</p>\
              <form method=\"post\" action=\"/_system/restart\"><button>Restart now</button></form>"
             .to_owned(),
-        Install::Failed { error } => format!(
-            "<p class=\"warn\">The last update didn't install. Nothing was changed.</p>\
-             <p class=\"muted\">{}</p>",
-            esc(error)
-        ),
-        Install::Idle => String::new(),
+        Install::Failed { .. } | Install::Idle => {
+            let mut b = match u.install {
+                Install::Failed { error } => format!(
+                    "<p class=\"warn\">The last update didn't install. Nothing was changed.</p>\
+                     <p class=\"muted\">{}</p>",
+                    esc(error)
+                ),
+                _ => String::new(),
+            };
+            b.push_str(&availability(u, running));
+            b
+        }
     };
-    let advanced = if matches!(install, Install::Running { .. }) {
+    let advanced = if matches!(u.install, Install::Running { .. }) {
         ""
     } else {
         "<details><summary class=\"muted\">Install from an address</summary>\
@@ -86,6 +102,31 @@ fn update_section(install: &Install) -> String {
          style=\"width:100%\"></p><p><button>Install</button></p></form></details>"
     };
     format!("<section><h2>Updates</h2>{body}{advanced}</section>")
+}
+
+/// "Update available" / "up to date" from the release manifest
+fn availability(u: &Updates, running: &str) -> String {
+    if !u.checks_configured {
+        return "<p class=\"muted\">This build doesn't check for updates.</p>".to_owned();
+    }
+    let check = u.manifest;
+    if check.checking {
+        return "<p class=\"muted\">Checking for updates…</p>".to_owned();
+    }
+    let mut b = match check.latest.as_ref().and_then(|m| m.os.as_ref()) {
+        Some(os) if os_newer(&os.version, running) => format!(
+            "<p class=\"warn\">A system update is available: {}</p>\
+             <form method=\"post\" action=\"/_system/os/update\"><button>Install update</button></form>",
+            esc(&os.version)
+        ),
+        Some(_) => "<p class=\"ok\">The system is up to date.</p>".to_owned(),
+        None => String::new(),
+    };
+    if let Some(error) = &check.error {
+        let _ = write!(b, "<p class=\"muted\">Couldn't check for updates: {}</p>", esc(error));
+    }
+    b.push_str("<form method=\"post\" action=\"/_system/check\"><button>Check now</button></form>");
+    b
 }
 
 fn tailscale_update_line(update: &Update) -> String {
@@ -110,7 +151,7 @@ fn tailscale_update_line(update: &Update) -> String {
     }
 }
 
-pub fn status(s: &Status, install: &Install, ts_update: &Update) -> String {
+pub fn status(s: &Status, updates: &Updates) -> String {
     let mut b = String::from("<h1>Box</h1>");
 
     // System
@@ -146,7 +187,7 @@ pub fn status(s: &Status, install: &Install, ts_update: &Update) -> String {
         "<section><h2>Remote access (Tailscale)</h2><p class=\"{class}\">{line}</p>\
          <p class=\"muted\">Version {}</p>{}</section>",
         esc(ts.version.as_deref().unwrap_or("unknown")),
-        tailscale_update_line(ts_update),
+        tailscale_update_line(updates.tailscale),
     );
 
     // Storage
@@ -155,15 +196,19 @@ pub fn status(s: &Status, install: &Install, ts_update: &Update) -> String {
         None => "<p class=\"warn\">The data area isn't available.</p>".to_owned(),
     };
     let _ = write!(b, "<section><h2>Storage</h2>{storage}</section>");
-    b.push_str(&update_section(install));
+    b.push_str(&update_section(updates, &s.os.version));
 
     b.push_str(
         "<p class=\"muted\"><a href=\"/\">Open the app</a> · \
          <a href=\"/_system/password\">Change password</a></p>\
          <form method=\"post\" action=\"/_system/logout\"><button>Sign out</button></form>",
     );
-    let busy = matches!(install, Install::Running { .. })
-        || matches!(ts_update, Update::Checking | Update::Downloading { .. } | Update::Installing { .. });
+    let busy = matches!(updates.install, Install::Running { .. })
+        || updates.manifest.checking
+        || matches!(
+            updates.tailscale,
+            Update::Checking | Update::Downloading { .. } | Update::Installing { .. }
+        );
     let refresh = busy.then_some((3, "/_system/"));
     page_refreshing("Box", &b, refresh)
 }
@@ -267,7 +312,15 @@ mod tests {
             data: Some(Disk { total_bytes: 30_000_000_000, free_bytes: 29_500_000_000 }),
             uptime_seconds: 3 * 3600 + 5 * 60,
         };
-        let html = status(&s, &Install::Idle, &Update::Idle);
+        let html = status(
+            &s,
+            &Updates {
+                install: &Install::Idle,
+                tailscale: &Update::Idle,
+                manifest: &Check::default(),
+                checks_configured: false,
+            },
+        );
         assert!(!html.contains("<script>") && html.contains("&lt;script&gt;"));
         assert!(html.contains("evil&lt;b&gt;"));
         assert!(html.contains("A backup copy of the system is ready"));
@@ -275,16 +328,42 @@ mod tests {
         assert!(html.contains("up 3 h 5 min"));
     }
 
+    fn section(install: &Install, manifest: &Check) -> String {
+        let u = Updates { install, tailscale: &Update::Idle, manifest, checks_configured: true };
+        update_section(&u, "2026.10.19.2244-g77ccad4")
+    }
+
     #[test]
     fn update_progress_refreshes_and_escapes() {
-        let running = update_section(&Install::Running { percent: 40, step: "<Copying>".into() });
+        let none = Check::default();
+        let running = section(&Install::Running { percent: 40, step: "<Copying>".into() }, &none);
         assert!(
             running.contains("40%") && running.contains("&lt;Copying&gt;") && !running.contains("<details>")
         );
-        let failed = update_section(&Install::Failed { error: "bad <sig>".into() });
+        let failed = section(&Install::Failed { error: "bad <sig>".into() }, &none);
         assert!(failed.contains("bad &lt;sig&gt;") && failed.contains("<details>"));
-        let installed = update_section(&Install::Installed);
-        assert!(installed.contains("/_system/restart"));
+        assert!(section(&Install::Installed, &none).contains("/_system/restart"));
+    }
+
+    #[test]
+    fn offers_a_newer_system_from_the_manifest() {
+        use crate::manifest::{Manifest, OsRelease};
+        let check = |version: &str| Check {
+            latest: Some(Manifest {
+                schema: 1,
+                os: Some(OsRelease { version: version.into(), bundle_url: "https://x/b.raucb".into() }),
+                app: None,
+            }),
+            ..Default::default()
+        };
+        let newer = section(&Install::Idle, &check("2026.10.20.0100-gabc"));
+        assert!(newer.contains("A system update is available: 2026.10.20.0100-gabc"));
+        assert!(newer.contains("/_system/os/update"));
+        let same = section(&Install::Idle, &check("2026.10.19.2244-g77ccad4"));
+        assert!(same.contains("up to date") && !same.contains("/_system/os/update"));
+        let failed =
+            section(&Install::Idle, &Check { error: Some("offline <x>".into()), ..Default::default() });
+        assert!(failed.contains("offline &lt;x&gt;") && failed.contains("Check now"));
     }
 
     #[test]

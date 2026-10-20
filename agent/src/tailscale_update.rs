@@ -13,10 +13,9 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use base64::Engine;
-use blake2::{Blake2s256, Digest};
+use blake2::Blake2s256;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Serialize;
 
@@ -25,7 +24,7 @@ const ROOT_KEYS: [&str; 2] = [
     include_str!("tailscale-roots/distsign-prod-root-1-pub.pem"),
 ];
 
-const MAX_TARBALL: usize = 200 << 20;
+const MAX_TARBALL: u64 = 200 << 20;
 /// Space needed on /data: the download plus the unpacked binaries
 const MIN_FREE_SPACE: u64 = 250 << 20;
 
@@ -159,74 +158,6 @@ fn version_numbers(v: &str) -> Vec<u64> {
     v.split('.').map(|n| n.parse().unwrap_or(0)).collect()
 }
 
-fn easy(url: &str) -> Result<curl::easy::Easy, String> {
-    let mut e = curl::easy::Easy::new();
-    let fail = |err: curl::Error| err.to_string();
-    e.url(url).map_err(fail)?;
-    e.follow_location(true).map_err(fail)?;
-    e.fail_on_error(true).map_err(fail)?;
-    e.connect_timeout(Duration::from_secs(30)).map_err(fail)?;
-    // Give up if a download stalls below 1 KB/s for a minute
-    e.low_speed_limit(1024).map_err(fail)?;
-    e.low_speed_time(Duration::from_secs(60)).map_err(fail)?;
-    Ok(e)
-}
-
-fn http_get(url: &str, limit: usize) -> Result<Vec<u8>, String> {
-    let mut e = easy(url)?;
-    let mut data = Vec::new();
-    {
-        let mut t = e.transfer();
-        t.write_function(|chunk| {
-            if data.len() + chunk.len() > limit {
-                return Ok(0); // makes curl abort
-            }
-            data.extend_from_slice(chunk);
-            Ok(chunk.len())
-        })
-        .map_err(|err| err.to_string())?;
-        t.perform().map_err(|err| format!("{url}: {err}"))?;
-    }
-    Ok(data)
-}
-
-/// Downloads to `path`, returning the file's BLAKE2s-256 hash and length.
-fn download(url: &str, path: &Path, mut progress: impl FnMut(u8)) -> Result<(Vec<u8>, u64), String> {
-    let mut e = easy(url)?;
-    e.progress(true).map_err(|err| err.to_string())?;
-    let mut file = std::fs::File::create(path).map_err(|err| err.to_string())?;
-    let mut hasher = Blake2s256::new();
-    let mut len = 0u64;
-    let mut write_error = None;
-    let result = {
-        let mut t = e.transfer();
-        t.write_function(|chunk| {
-            if len as usize + chunk.len() > MAX_TARBALL {
-                return Ok(0);
-            }
-            if let Err(err) = file.write_all(chunk) {
-                write_error = Some(err.to_string());
-                return Ok(0);
-            }
-            hasher.update(chunk);
-            len += chunk.len() as u64;
-            Ok(chunk.len())
-        })
-        .map_err(|err| err.to_string())?;
-        t.progress_function(|total, now, _, _| {
-            if total > 0.0 {
-                progress((now / total * 100.0) as u8);
-            }
-            true
-        })
-        .map_err(|err| err.to_string())?;
-        t.perform()
-    };
-    result.map_err(|err| write_error.unwrap_or_else(|| format!("{url}: {err}")))?;
-    file.sync_all().map_err(|err| err.to_string())?;
-    Ok((hasher.finalize().to_vec(), len))
-}
-
 /// Unpacks tailscale and tailscaled from the tarball into `releases/<version>`.
 fn unpack(tarball: &Path, version: &str, releases: &Path) -> Result<(), String> {
     let partial = releases.join(format!(".partial-{version}"));
@@ -276,7 +207,7 @@ fn update(config: &Config, state: &Mutex<Update>) -> Result<Update, String> {
     let set = |s: Update| *state.lock().unwrap() = s;
     let base = config.pkgs.trim_end_matches('/');
 
-    let index = http_get(&format!("{base}/{}/?mode=json", config.track), 1 << 20)?;
+    let index = crate::http::get(&format!("{base}/{}/?mode=json", config.track), 1 << 20)?;
     let index: serde_json::Value =
         serde_json::from_slice(&index).map_err(|e| format!("version list: {e}"))?;
     let latest = index["TarballsVersion"].as_str().ok_or("version list has no TarballsVersion")?.to_owned();
@@ -289,8 +220,8 @@ fn update(config: &Config, state: &Mutex<Update>) -> Result<Update, String> {
         return Ok(Update::UpToDate { version: running });
     }
 
-    let bundle = http_get(&format!("{base}/distsign.pub"), 64 << 10)?;
-    let bundle_sig = http_get(&format!("{base}/distsign.pub.sig"), 1 << 10)?;
+    let bundle = crate::http::get(&format!("{base}/distsign.pub"), 64 << 10)?;
+    let bundle_sig = crate::http::get(&format!("{base}/distsign.pub.sig"), 1 << 10)?;
     let keys = signing_keys(&config.roots, &bundle, &bundle_sig)?;
 
     std::fs::create_dir_all(&config.releases).map_err(|e| e.to_string())?;
@@ -300,11 +231,11 @@ fn update(config: &Config, state: &Mutex<Update>) -> Result<Update, String> {
     let download_path = config.releases.join(format!(".download-{latest}.tgz"));
     set(Update::Downloading { version: latest.clone(), percent: 0 });
     let url = format!("{base}/{}/{tarball}", config.track);
-    let result = download(&url, &download_path, |percent| {
+    let result = crate::http::download::<Blake2s256>(&url, &download_path, MAX_TARBALL, |percent| {
         set(Update::Downloading { version: latest.clone(), percent });
     })
     .and_then(|(hash, len)| {
-        let sig = http_get(&format!("{url}.sig"), 1 << 10)?;
+        let sig = crate::http::get(&format!("{url}.sig"), 1 << 10)?;
         if !verify_any(&keys, &package_message(&hash, len), &sig) {
             return Err("the download's signature doesn't check out; nothing was installed".into());
         }
@@ -330,8 +261,10 @@ mod tests {
     use super::*;
     use axum::Router;
     use axum::routing::get;
+    use blake2::Digest;
     use ed25519_dalek::{Signer, SigningKey};
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     #[test]
     fn real_tailscale_key_chain() {

@@ -5,3 +5,5 @@ Machine-local files for dev builds (this folder is gitignored):
               sudo tools/set-wifi.sh /media/$USER/data instead.
   rauc/     - dev update signing key, generated on first build. Back it up:
               dev devices only accept updates signed with it.
+  manifest/ - dev release-manifest signing key, generated on first build. Back
+              it up too: dev devices only trust manifests signed with it.
