@@ -537,9 +537,11 @@ def main():
         check_slot_basics(con, "B")
         check("slot B sees the same /data", con.sh("cat /data/marker")[1].splitlines()[-1] == "kept")
         check_agent(con, "B")
-        rc, _ = con.sh("systemctl is-active -q box-app && wget -q -T 10 -O /dev/null http://127.0.0.1:3100/",
-                       timeout=120, check=False)
-        check("app still running after the OS update", rc == 0)
+        # The service is up as soon as it launches; the app opens its port a bit later
+        rc, out = con.sh("for i in $(seq 40); do wget -q -T 5 -O /dev/null http://127.0.0.1:3100/ && exit_ok=1 && break; "
+                         "sleep 3; done; [ -n \"$exit_ok\" ] || journalctl -u box-app -n 15 --no-pager; [ -n \"$exit_ok\" ]",
+                         timeout=300, check=False)
+        check("app still running after the OS update", rc == 0, "" if rc == 0 else out[-600:])
         check("activated Tailscale survives the OS update",
               "/data/tailscale/releases/9999.0.0/" in tailscaled_exe(con), tailscaled_exe(con))
         version_b = con.sh("cat /etc/box-version")[1].splitlines()[-1]
