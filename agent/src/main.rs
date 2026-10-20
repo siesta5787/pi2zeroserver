@@ -8,13 +8,17 @@
 //! It lives in the read-only OS image and only changes with OS updates, so a
 //! bad app update can never take away the page used to fix it.
 
+mod app_update;
 mod auth;
+mod box_api;
 mod http;
 mod manifest;
 mod os_update;
 mod pages;
+mod progress;
 mod proxy;
 mod status;
+mod tailscale_serve;
 mod tailscale_update;
 
 use std::net::SocketAddr;
@@ -35,6 +39,8 @@ struct AppState {
     os_update: os_update::OsUpdate,
     tailscale_update: tailscale_update::TailscaleUpdate,
     manifests: manifest::Manifests,
+    app_update: app_update::AppUpdate,
+    tailscale_serve: tailscale_serve::Shared,
     /// Command that restarts the box (replaced in tests)
     reboot: Arc<Vec<String>>,
 }
@@ -50,6 +56,8 @@ impl AppState {
             )),
             os_update: os_update::OsUpdate::new("rauc".into()),
             manifests: manifest::Manifests::new(manifest::Config::device()),
+            app_update: app_update::AppUpdate::new(app_update::Config::device()),
+            tailscale_serve: Default::default(),
             tailscale_update: tailscale_update::TailscaleUpdate::new(tailscale_update::Config::device()),
             reboot: Arc::new(vec!["systemctl".into(), "reboot".into()]),
         }
@@ -58,17 +66,23 @@ impl AppState {
 
 struct Args {
     listen: SocketAddr,
+    tailnet_listen: SocketAddr,
     app: SocketAddr,
     data_dir: PathBuf,
+    api_socket: PathBuf,
 }
 
-const USAGE: &str = "usage: box-agent [--listen ADDR:PORT] [--app ADDR:PORT] [--data-dir DIR]";
+const USAGE: &str = "usage: box-agent [--listen ADDR:PORT] [--tailnet-listen ADDR:PORT] [--app ADDR:PORT] [--data-dir DIR] \
+     [--api-socket PATH]";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         listen: "0.0.0.0:80".parse().unwrap(),
-        app: "127.0.0.1:8080".parse().unwrap(),
+        tailnet_listen: "127.0.0.1:8081".parse().unwrap(),
+        // kid-phone-server's default
+        app: "127.0.0.1:3100".parse().unwrap(),
         data_dir: "/data/agent".into(),
+        api_socket: "/run/box/api.sock".into(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -76,15 +90,26 @@ fn parse_args() -> Result<Args, String> {
         let bad = |e: &dyn std::fmt::Display| format!("{arg} {value:?}: {e}");
         match arg.as_str() {
             "--listen" => args.listen = value.parse().map_err(|e| bad(&e))?,
+            "--tailnet-listen" => args.tailnet_listen = value.parse().map_err(|e| bad(&e))?,
             "--app" => args.app = value.parse().map_err(|e| bad(&e))?,
             "--data-dir" => args.data_dir = value.into(),
+            "--api-socket" => args.api_socket = value.into(),
             _ => return Err(format!("unknown argument {arg:?}\n{USAGE}")),
         }
     }
     Ok(args)
 }
 
-fn router(state: AppState) -> Router {
+/// Which way a request came in
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Front {
+    /// Port 80 on the home network: the box's own pages only
+    Lan,
+    /// 127.0.0.1:8081, reached only through `tailscale serve` (HTTPS): box pages and the app
+    Tailnet,
+}
+
+fn router(state: AppState, front: Front) -> Router {
     let system = Router::new()
         .route("/_system", get(|| async { Redirect::permanent("/_system/") }))
         .route("/_system/", get(status_page))
@@ -100,22 +125,45 @@ fn router(state: AppState) -> Router {
         .route("/_system/os/update", post(os_update_form))
         .route("/_system/api/updates", get(updates_state))
         .route("/_system/api/updates/check", post(check_api))
+        .route("/_system/app/update", post(app_update_form))
+        .route("/_system/app/initial-password/forget", post(forget_initial_password))
+        .route("/_system/api/app/update", get(app_update_state).post(app_update_api))
         .route("/_system/api/tailscale/update", get(tailscale_update_state).post(tailscale_update_api))
         .route("/_system/tailscale/update", post(tailscale_update_form))
         // Unknown system paths stay with the agent rather than reaching the app
         .route("/_system/{*rest}", any(|| async { StatusCode::NOT_FOUND }))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard));
-    Router::new().merge(system).fallback(proxy::forward).with_state(state)
+    let app = match front {
+        Front::Lan => Router::new().fallback(app_on_tailnet),
+        Front::Tailnet => Router::new().fallback(proxy::forward),
+    };
+    Router::new().merge(system).merge(app).with_state(state)
+}
+
+async fn app_on_tailnet() -> impl IntoResponse {
+    let s = status::gather().await;
+    Html(pages::app_on_tailnet(s.tailscale.dns_name.as_deref()))
 }
 
 async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
-    let (install, tailscale, manifest) =
-        (state.os_update.state(), state.tailscale_update.state(), state.manifests.state());
+    let (install, tailscale, manifest, app) = (
+        state.os_update.state(),
+        state.tailscale_update.state(),
+        state.manifests.state(),
+        state.app_update.state(),
+    );
+    let (app_installed, app_initial_password) =
+        (state.app_update.installed_version(), state.app_update.initial_admin_password());
+    let serve = state.tailscale_serve.lock().unwrap().clone();
     let updates = pages::Updates {
         install: &install,
         tailscale: &tailscale,
         manifest: &manifest,
         checks_configured: state.manifests.configured(),
+        app: &app,
+        app_installed: app_installed.as_deref(),
+        app_initial_password: app_initial_password.as_deref(),
+        serve: &serve,
     };
     Html(pages::status(&status::gather().await, &updates))
 }
@@ -158,6 +206,56 @@ async fn check_api(State(state): State<AppState>) -> Response {
 
 async fn updates_state(State(state): State<AppState>) -> impl IntoResponse {
     axum::Json(state.manifests.state())
+}
+
+/// The app release the manifest names, if any
+fn manifest_app(state: &AppState) -> Option<manifest::AppRelease> {
+    state.manifests.state().latest.and_then(|m| m.app)
+}
+
+async fn app_update_form(State(state): State<AppState>) -> Redirect {
+    if let Some(app) = manifest_app(&state) {
+        state.app_update.start(app);
+    }
+    Redirect::to("/_system/")
+}
+
+async fn app_update_state(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.app_update.state())
+}
+
+async fn app_update_api(State(state): State<AppState>) -> Response {
+    let Some(app) = manifest_app(&state) else {
+        return (StatusCode::CONFLICT, "no app release known yet; check for updates first").into_response();
+    };
+    let status = if state.app_update.start(app) { StatusCode::ACCEPTED } else { StatusCode::CONFLICT };
+    (status, axum::Json(state.app_update.state())).into_response()
+}
+
+async fn forget_initial_password(State(state): State<AppState>) -> Redirect {
+    state.app_update.forget_initial_admin_password();
+    Redirect::to("/_system/")
+}
+
+/// Installs the app as soon as a manifest names one, if none is installed yet.
+/// Retries hourly after a failure (say, the download broke off).
+fn spawn_first_app_install(state: AppState) {
+    tokio::spawn(async move {
+        let mut last_attempt: Option<std::time::Instant> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if state.app_update.installed_version().is_some() || state.app_update.state().busy() {
+                continue;
+            }
+            if last_attempt.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3600)) {
+                continue;
+            }
+            if let Some(app) = manifest_app(&state) {
+                last_attempt = Some(std::time::Instant::now());
+                state.app_update.start(app);
+            }
+        }
+    });
 }
 
 /// Installs the OS release the manifest names
@@ -203,7 +301,8 @@ async fn tailscale_update_form(State(state): State<AppState>) -> Redirect {
 }
 
 /// Restarts the box shortly after answering, so the page still arrives.
-async fn restart(State(state): State<AppState>) -> impl IntoResponse {
+/// Restarts the box a second from now, so the caller still gets its answer.
+fn schedule_restart(state: &AppState) {
     let cmd = state.reboot.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -211,6 +310,10 @@ async fn restart(State(state): State<AppState>) -> impl IntoResponse {
             eprintln!("restarting: {e}");
         }
     });
+}
+
+async fn restart(State(state): State<AppState>) -> impl IntoResponse {
+    schedule_restart(&state);
     Html(pages::restarting())
 }
 
@@ -311,6 +414,7 @@ async fn main() {
     };
     let state = AppState::new(args.app, args.data_dir);
     state.manifests.spawn_periodic();
+    spawn_first_app_install(state.clone());
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -318,8 +422,36 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("box-agent listening on {}, app at {}", args.listen, args.app);
-    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+    // The app's way in; a failure here mustn't take down the system pages
+    match box_api::listen(&args.api_socket, Some("app")) {
+        Ok(api) => {
+            let api_router = box_api::router(state.clone());
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(api, api_router).await {
+                    eprintln!("box API server error: {e}");
+                }
+            });
+        }
+        Err(e) => eprintln!("box API not available at {}: {e}", args.api_socket.display()),
+    }
+    match tokio::net::TcpListener::bind(args.tailnet_listen).await {
+        Ok(tailnet) => {
+            let service =
+                router(state.clone(), Front::Tailnet).into_make_service_with_connect_info::<SocketAddr>();
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(tailnet, service).await {
+                    eprintln!("tailnet server error: {e}");
+                }
+            });
+        }
+        Err(e) => eprintln!("can't listen on {} for tailscale serve: {e}", args.tailnet_listen),
+    }
+    tailscale_serve::spawn(state.tailscale_serve.clone(), args.tailnet_listen);
+    eprintln!(
+        "box-agent listening on {} (home network) and {} (tailnet), app at {}",
+        args.listen, args.tailnet_listen, args.app
+    );
+    let app = router(state, Front::Lan).into_make_service_with_connect_info::<SocketAddr>();
     if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await {
         eprintln!("server error: {e}");
         std::process::exit(1);
@@ -339,14 +471,25 @@ mod tests {
         _data: tempfile::TempDir,
     }
 
-    /// Starts the agent on a free port, proxying to `app`, with an empty data dir.
+    /// Agent state for tests: data in `dir`, and restarting does nothing.
+    pub(crate) fn test_state(dir: &std::path::Path) -> AppState {
+        let mut state = AppState::new("127.0.0.1:9".parse().unwrap(), dir.to_owned());
+        state.reboot = Arc::new(vec!["true".into()]);
+        state
+    }
+
+    /// Starts the agent's tailnet front on a free port, proxying to `app`, with an empty data dir.
     async fn start_agent(app: SocketAddr) -> Agent {
+        start_front(app, Front::Tailnet).await
+    }
+
+    async fn start_front(app: SocketAddr, front: Front) -> Agent {
         let data = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut state = AppState::new(app, data.path().to_owned());
-        state.reboot = Arc::new(vec!["true".into()]);
-        let service = router(state).into_make_service_with_connect_info::<SocketAddr>();
+        let mut state = test_state(data.path());
+        state.proxy = proxy::Proxy::new(app);
+        let service = router(state, front).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
         Agent { addr, _data: data }
     }
@@ -556,6 +699,38 @@ mod tests {
         assert_eq!(r.status, StatusCode::OK);
         assert_eq!(r.headers.get("x-app").unwrap(), "yes");
         assert_eq!(r.body, "/hello?x=1 127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn home_network_gets_box_pages_but_not_the_app() {
+        let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_addr = app_listener.local_addr().unwrap();
+        let app = Router::new().route("/devices", get(|| async { "secret app page" }));
+        tokio::spawn(async move { axum::serve(app_listener, app).await.unwrap() });
+
+        let lan = start_front(app_addr, Front::Lan).await;
+        let r = fetch(&lan, "/devices", None).await;
+        assert!(!r.body.contains("secret app page"), "the app must not be reachable from the LAN");
+        assert!(r.body.contains("Tailscale"), "{}", r.body);
+        assert_eq!(fetch(&lan, "/_system/api/health", None).await.body, "ok");
+
+        let tailnet = start_front(app_addr, Front::Tailnet).await;
+        assert_eq!(fetch(&tailnet, "/devices", None).await.body, "secret app page");
+    }
+
+    #[tokio::test]
+    async fn tailnet_front_tells_the_app_it_is_https() {
+        let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_addr = app_listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/proto",
+            get(|headers: HeaderMap| async move {
+                headers.get("x-forwarded-proto").map(|v| v.to_str().unwrap().to_owned()).unwrap_or_default()
+            }),
+        );
+        tokio::spawn(async move { axum::serve(app_listener, app).await.unwrap() });
+        let tailnet = start_agent(app_addr).await;
+        assert_eq!(fetch(&tailnet, "/proto", None).await.body, "https");
     }
 
     #[tokio::test]

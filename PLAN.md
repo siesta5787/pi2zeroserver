@@ -223,8 +223,15 @@ RPi Server DIstro/          (this folder, git)
      /etc/box) a minute after boot and every ~12 h, shows "system update
      available" with an Install button. `tools/publish-release.sh` builds, signs
      and publishes it (pinning a kid-phone-server release by SHA-256).
-   - 5f: app releases with activate/rollback; box API socket; tailnet listener
-     + tailscale serve
+   - ✅ 5f: app hosting. kid-phone-server runs as user `app` (fixed UID 950),
+     sandboxed, from /data/app/current; first install happens by itself once the
+     manifest names a release (SHA-256 checked, unpacked so nothing escapes);
+     `app-activate` snapshots the DB, switches, health-checks and restores +
+     switches back on failure. Box API on /run/box/api.sock (root:app 0660), see
+     docs/box-api.md. Home LAN (port 80) gets /_system/ only; the app is on the
+     tailnet front (127.0.0.1:8081) published with `tailscale serve --https=443`,
+     forwarded with X-Forwarded-Proto: https. QEMU test runs the real
+     kid-phone-server 0.18.6 binary.
 6. Onboarding: AP, captive portal, Tailscale QR.
 7. Hardening: firewall, sandboxing, release defconfig (no curl CLI, no HDMI
    console login, release signing key).

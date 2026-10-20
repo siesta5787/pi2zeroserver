@@ -1,0 +1,98 @@
+#!/bin/sh
+# Usage: app-activate VERSION
+#
+# Switch the app to /data/app/releases/VERSION (unpacked and verified by the
+# agent: an `app` executable and a VERSION file) and check it starts:
+#   1. stop the app and snapshot its SQLite database files
+#   2. point /data/app/current at the new release and start it
+#   3. wait up to 90 s for it to answer HTTP on BIND_ADDR (redirects are
+#      followed; any error status counts as not working)
+# If it doesn't, restore the snapshot (the new version may already have
+# migrated the database, which the old one can't read), switch back and start
+# the previous release again.
+#
+# Exit status: 0 activated, 1 failed and rolled back, 2 release not usable.
+set -eu
+
+APP=/data/app
+ver="${1:?usage: app-activate VERSION}"
+rel="${APP}/releases/${ver}"
+snapshot="${APP}/snapshots/before-${ver}"
+
+if [ ! -x "${rel}/app" ] || [ "$(cat "${rel}/VERSION" 2>/dev/null)" != "${ver}" ]; then
+	echo "${rel} is not a complete app release" >&2
+	exit 2
+fi
+
+# Where the app listens, from its environment (default matches kid-phone-server)
+bind="$(sed -n 's/^BIND_ADDR=//p' "${APP}/env" 2>/dev/null | tail -n 1)"
+url="http://${bind:-127.0.0.1:3100}/"
+
+healthy() {
+	deadline=$(($(cut -d. -f1 /proc/uptime) + 90))
+	while [ "$(cut -d. -f1 /proc/uptime)" -lt "${deadline}" ]; do
+		if systemctl is-active -q box-app && wget -q -T 10 -O /dev/null "${url}" 2>/dev/null; then
+			return 0
+		fi
+		sleep 3
+	done
+	return 1
+}
+
+# The SQLite files at the top of the state dir (database, -wal, -shm)
+db_files() {
+	find "${APP}/state" -maxdepth 1 -type f \( -name '*.db' -o -name '*.db-wal' -o -name '*.db-shm' \)
+}
+
+prev="$(readlink "${APP}/current" 2>/dev/null || true)"
+
+systemctl stop box-app || true
+rm -rf "${snapshot}"
+mkdir -p "${snapshot}"
+db_files | while read -r f; do cp -p "${f}" "${snapshot}/"; done
+sync
+
+ln -sfn "releases/${ver}" "${APP}/current"
+sync
+systemctl start box-app || true
+
+if healthy; then
+	# Keep this release and the one before it, and only this update's snapshot
+	for d in "${APP}"/releases/*; do
+		[ -e "${d}" ] || continue
+		case "$(basename "${d}")" in
+		"${ver}" | "$(basename "${prev:-none}")") ;;
+		*) rm -rf "${d}" ;;
+		esac
+	done
+	for s in "${APP}"/snapshots/*; do
+		if [ -e "${s}" ] && [ "${s}" != "${snapshot}" ]; then
+			rm -rf "${s}"
+		fi
+	done
+	echo "App ${ver} active"
+	exit 0
+fi
+
+echo "App ${ver} didn't come up; restoring its data and switching back" >&2
+systemctl stop box-app || true
+db_files | while read -r f; do rm -f "${f}"; done
+for f in "${snapshot}"/*; do
+	if [ -e "${f}" ]; then
+		cp -p "${f}" "${APP}/state/"
+	fi
+done
+if [ -n "${prev}" ]; then
+	ln -sfn "${prev}" "${APP}/current"
+else
+	rm -f "${APP}/current"
+fi
+sync
+if [ -n "${prev}" ]; then
+	systemctl start box-app || true
+	# Report only once the previous version is answering again
+	if ! healthy; then
+		echo "The previous version isn't answering either" >&2
+	fi
+fi
+exit 1

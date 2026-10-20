@@ -81,6 +81,10 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
 - Resizing a partition makes udev re-probe it and briefly drop its by-label
   link; systemd then unmounts anything bound to it. `grow-data` does all
   resizing before `/data` is mounted and waits with `udevadm settle`.
+- Don't order units on `network-online.target`: it pulls in
+  systemd-networkd-wait-online, which fails after ~2 min whenever there's no
+  network (before Wi-Fi setup, in QEMU) and leaves the system degraded. Use
+  `network.target` and let services cope without a network.
 - No RTC: `/usr/lib/clock-epoch` (stamped in `post-build.sh`) keeps the clock at
   least at build time, or offline devices reject bundle signatures.
 

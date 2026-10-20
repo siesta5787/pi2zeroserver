@@ -42,6 +42,10 @@ WORK = os.path.join(OUT, "qemu-ab-test")
 LOG = os.path.join(OUT, "qemu-ab-test.log")
 RAUC_KEY = os.path.join(PROJECT, "local", "rauc", "dev-key.pem")
 RAUC_CERT = os.path.join(PROJECT, "local", "rauc", "dev-cert.pem")
+# The real app, run on the emulated box (QEMU has no internet, so it's fetched here)
+APP_VERSION = "0.18.6"
+APP_URL = ("https://github.com/siesta5787/kid-phone-server/releases/download/"
+           f"v{APP_VERSION}/kid-phone-server-aarch64-unknown-linux-musl.tar.gz")
 
 
 def run(*cmd, **kw):
@@ -153,8 +157,17 @@ def prepare_card(rootfs):
     return card
 
 
+def app_tarball():
+    path = os.path.join(WORK, f"app-{APP_VERSION}.tgz")
+    if not os.path.exists(path):
+        subprocess.run(["curl", "-fsSL", "-o", path + ".part", APP_URL], check=True)
+        os.rename(path + ".part", path)
+    return path
+
+
 def inject_bundle(card, bundle):
-    """Copy the bundle onto the (now grown) data partition while QEMU is off."""
+    """Copy the bundle and the app tarball onto the (now grown) data partition
+    while QEMU is off."""
     start, size = partitions(card)[3]
     part = os.path.join(WORK, "data.ext4")
     with open(card, "rb") as src, open(part, "wb") as dst:
@@ -165,6 +178,7 @@ def inject_bundle(card, bundle):
     if rc >= 4:
         sys.exit(f"e2fsck could not repair the data partition (rc={rc})")
     run(os.path.join(SBIN, "debugfs"), "-w", "-R", f"write {bundle} update.raucb", part)
+    run(os.path.join(SBIN, "debugfs"), "-w", "-R", f"write {app_tarball()} app.tgz", part)
     with open(part, "rb") as src, open(card, "r+b") as dst:
         dst.seek(start)
         shutil.copyfileobj(src, dst)
@@ -350,8 +364,11 @@ def check_agent(con, slot):
     check(f"status API reports slot {slot}", status.get("os", {}).get("booted_slot") == slot, out[-200:])
     check("status API reports Tailscale", status.get("tailscale", {}).get("running") is True,
           str(status.get("tailscale")))
-    rc, out = con.sh("wget -T 10 -O /dev/null http://127.0.0.1/ 2>&1", check=False)
-    check("no app installed: friendly 502 page", "502" in out, out.splitlines()[-1] if out else "")
+    rc, out = con.sh("wget -q -T 10 -O - http://127.0.0.1/ | grep -c 'Open the app over Tailscale'", check=False)
+    check("home network points to the app on Tailscale", rc == 0, out.splitlines()[-1] if out else "")
+    if slot == "A":
+        rc, out = con.sh("wget -T 10 -O /dev/null http://127.0.0.1:8081/ 2>&1", check=False)
+        check("tailnet front, no app yet: friendly 502 page", "502" in out, out.splitlines()[-1] if out else "")
     if slot == "A":
         rc, _ = con.sh("test -s /etc/ssl/certs/ca-certificates.crt", check=False)
         check("CA certificates installed for HTTPS", rc == 0)
@@ -388,6 +405,51 @@ def check_agent(con, slot):
         check("Tailscale updater fails cleanly offline",
               state.get("state") == "failed" and "pkgs.tailscale.com" in error
               and "Unsupported protocol" not in error, str(state))
+
+
+def stage_app(con, version, broken=False):
+    """Unpack a release the way the agent does: binary + static/, `app` link, VERSION."""
+    rel = f"/data/app/releases/{version}"
+    binary = (f"printf '#!/bin/sh\\nexit 1\\n' > {rel}/kid_phone_server && chmod 755 {rel}/kid_phone_server"
+              if broken else f"chmod 755 {rel}/kid_phone_server")
+    con.sh(f"mkdir -p {rel} && gunzip -c /data/app.tgz | tar -x -C {rel} && {binary} "
+           f"&& ln -sfn kid_phone_server {rel}/app && echo {version} > {rel}/VERSION && sync", timeout=600)
+
+
+def check_app(con):
+    # First install: the agent writes the environment from the image's template
+    con.sh("cp /etc/box/app.env /data/app/env && echo ADMIN_PASSWORD=qemu-test-admin >> /data/app/env "
+           "&& chmod 600 /data/app/env")
+    stage_app(con, APP_VERSION)
+    rc, out = con.sh(f"/usr/libexec/box/app-activate {APP_VERSION}", timeout=300, check=False)
+    check("kid-phone-server activates", rc == 0, out.splitlines()[-1] if out else "")
+    rc, out = con.sh("wget -q -T 10 -O - http://127.0.0.1:3100/ | grep -ci '<form'", timeout=60, check=False)
+    check("kid-phone-server answers (login page)", rc == 0, out.splitlines()[-1] if out else "")
+    rc, out = con.sh("wget -q -T 10 -O - http://127.0.0.1:8081/ | grep -ci '<form'", timeout=60, check=False)
+    check("app reachable through the tailnet front", rc == 0, out.splitlines()[-1] if out else "")
+    rc, out = con.sh("awk '/^Uid:/ {print $2}' /proc/$(pidof kid_phone_server)/status", check=False)
+    check("app runs as the unprivileged app user (950)", out.splitlines()[-1:] == ["950"], out)
+    rc, out = con.sh("ls -l /data/app/state/kidphone.db | cut -c1-10,16-30", check=False)
+    check("app database created in /data/app/state", rc == 0 and "app" in out, out)
+
+    rc, out = con.sh("ls -l /run/box/api.sock | cut -c1-10; ls -ln /run/box/api.sock | awk '{print $3, $4}'",
+                     check=False)
+    check("box API socket only for root and the app group", out.split() == ["srw-rw----", "0", "950"], out)
+    rc, out = con.sh("curl -s -m 30 --unix-socket /run/box/api.sock http://box/v1/status", timeout=60, check=False)
+    try:
+        api = json.loads(out.splitlines()[-1])
+    except (ValueError, IndexError):
+        api = {}
+    check("box API reports the running app", api.get("app", {}).get("version") == APP_VERSION,
+          str(api.get("app")))
+
+    stage_app(con, "0.18.7", broken=True)
+    rc, out = con.sh("/usr/libexec/box/app-activate 0.18.7", timeout=400, check=False)
+    check("broken app release is rolled back", rc == 1, out.splitlines()[-1] if out else "")
+    link = con.sh("readlink /data/app/current")[1].splitlines()[-1]
+    rc, _ = con.sh("wget -q -T 10 -O /dev/null http://127.0.0.1:3100/ && test -s /data/app/state/kidphone.db",
+                   timeout=120, check=False)
+    check("previous app and its database back", link == f"releases/{APP_VERSION}" and rc == 0, link)
 
 
 def check_tailscale(con):
@@ -461,6 +523,7 @@ def main():
         con.expect(r"Booting slot A", 300)
         con.login()
         check("/data intact after power cut", con.sh("cat /data/marker")[1].splitlines()[-1] == "kept")
+        check_app(con)
         version_a = con.sh("cat /etc/box-version")[1].splitlines()[-1]
 
         cookie = install_via_agent(con)
@@ -474,6 +537,9 @@ def main():
         check_slot_basics(con, "B")
         check("slot B sees the same /data", con.sh("cat /data/marker")[1].splitlines()[-1] == "kept")
         check_agent(con, "B")
+        rc, _ = con.sh("systemctl is-active -q box-app && wget -q -T 10 -O /dev/null http://127.0.0.1:3100/",
+                       timeout=120, check=False)
+        check("app still running after the OS update", rc == 0)
         check("activated Tailscale survives the OS update",
               "/data/tailscale/releases/9999.0.0/" in tailscaled_exe(con), tailscaled_exe(con))
         version_b = con.sh("cat /etc/box-version")[1].splitlines()[-1]

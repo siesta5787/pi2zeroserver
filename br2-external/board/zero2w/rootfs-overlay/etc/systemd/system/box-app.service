@@ -1,0 +1,40 @@
+# The app (kid-phone-server), installed and updated on /data by the agent.
+# Its own data lives in /data/app/state, the only place it can write.
+[Unit]
+Description=The app (kid-phone-server)
+Wants=network.target
+After=network.target tailscaled.service box-agent.service
+RequiresMountsFor=/data
+ConditionPathExists=/data/app/current/app
+
+[Service]
+User=app
+Group=app
+WorkingDirectory=/data/app/run
+EnvironmentFile=/data/app/env
+Environment=BOX_API_SOCKET=/run/box/api.sock
+ExecStart=/data/app/current/app
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/data/app/state
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

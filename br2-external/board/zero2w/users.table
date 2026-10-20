@@ -1,0 +1,2 @@
+# Fixed IDs: files on /data outlive OS updates, so these must never change.
+app 950 app 950 * - - - Box app (kid-phone-server)

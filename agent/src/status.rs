@@ -12,6 +12,8 @@ pub struct Status {
     /// None if /data isn't mounted
     pub data: Option<Disk>,
     pub uptime_seconds: u64,
+    /// box-app.service is running
+    pub app_running: bool,
 }
 
 #[derive(Serialize, Debug, PartialEq, Default)]
@@ -60,9 +62,10 @@ async fn json_command(program: &str, args: &[&str]) -> Option<Value> {
 }
 
 pub async fn gather() -> Status {
-    let (rauc, tailscale) = tokio::join!(
+    let (rauc, tailscale, app_running) = tokio::join!(
         json_command("rauc", &["status", "--output-format=json"]),
         json_command("tailscale", &["status", "--json"]),
+        unit_active("box-app"),
     );
     let mut os = rauc.as_ref().map(parse_rauc).unwrap_or_default();
     os.version = read_trimmed("/etc/box-version").unwrap_or_else(|| "unknown".into());
@@ -73,7 +76,14 @@ pub async fn gather() -> Status {
         uptime_seconds: read_trimmed("/proc/uptime")
             .and_then(|s| s.split('.').next().and_then(|n| n.parse().ok()))
             .unwrap_or(0),
+        app_running,
     }
+}
+
+async fn unit_active(unit: &str) -> bool {
+    let run =
+        tokio::process::Command::new("systemctl").args(["is-active", "-q", unit]).kill_on_drop(true).status();
+    matches!(tokio::time::timeout(COMMAND_TIMEOUT, run).await, Ok(Ok(status)) if status.success())
 }
 
 fn read_trimmed(path: &str) -> Option<String> {

@@ -4,16 +4,22 @@ use std::fmt::Write;
 
 use crate::manifest::{Check, os_newer};
 use crate::os_update::Install;
+use crate::progress::Progress;
 use crate::status::Status;
-use crate::tailscale_update::Update;
 
-/// Everything about updates the status page shows
+/// Everything besides `Status` that the status page shows: update jobs, and
+/// whether the app is published over Tailscale
 pub struct Updates<'a> {
+    pub serve: &'a crate::tailscale_serve::Serve,
     pub install: &'a Install,
-    pub tailscale: &'a Update,
+    pub tailscale: &'a Progress,
     pub manifest: &'a Check,
     /// False if this image has no manifest address/key
     pub checks_configured: bool,
+    pub app: &'a Progress,
+    pub app_installed: Option<&'a str>,
+    /// The generated first-login password, until dismissed
+    pub app_initial_password: Option<&'a str>,
 }
 
 /// Escapes text for HTML element content and attribute values.
@@ -104,6 +110,68 @@ fn update_section(u: &Updates, running: &str) -> String {
     format!("<section><h2>Updates</h2>{body}{advanced}</section>")
 }
 
+fn app_section(s: &Status, u: &Updates) -> String {
+    let mut b = String::from("<section><h2>App</h2>");
+    match u.app_installed {
+        Some(v) if s.app_running => {
+            let _ = write!(b, "<p class=\"ok\">kid-phone-server {} is running.</p>", esc(v));
+        }
+        Some(v) => {
+            let _ = write!(b, "<p class=\"warn\">kid-phone-server {} is installed but not running.</p>", esc(v));
+        }
+        None => b.push_str(
+            "<p class=\"warn\">Not installed yet. It installs by itself once the box can reach the internet.</p>",
+        ),
+    }
+    if let Some(name) =
+        s.tailscale.dns_name.as_deref().filter(|_| u.app_installed.is_some() && u.serve.configured)
+    {
+        let _ = write!(b, "<p><a href=\"https://{0}/\">Open the app at https://{0}/</a></p>", esc(name));
+    }
+    if let Some(password) = u.app_initial_password {
+        let _ = write!(
+            b,
+            "<p>First sign-in to the app: username <b>admin</b>, password <b>{}</b>. \
+             It asks you to choose your own straight away.</p>\
+             <form method=\"post\" action=\"/_system/app/initial-password/forget\">\
+             <button>I've signed in, hide this</button></form>",
+            esc(password)
+        );
+    }
+    let newer = u
+        .manifest
+        .latest
+        .as_ref()
+        .and_then(|m| m.app.as_ref())
+        .filter(|app| u.app_installed.is_some_and(|v| crate::app_update::app_newer(&app.version, v)));
+    match u.app {
+        Progress::Checking => b.push_str("<p class=\"muted\">Getting ready…</p>"),
+        Progress::Downloading { version, percent } => {
+            let _ = write!(b, "<p class=\"warn\">Downloading version {}: {percent}%</p>", esc(version));
+        }
+        Progress::Installing { version } => {
+            let _ = write!(b, "<p class=\"warn\">Installing version {}…</p>", esc(version));
+        }
+        Progress::Failed { error } => {
+            let _ = write!(b, "<p class=\"warn\">The app wasn't updated: {}</p>", esc(error));
+        }
+        Progress::Updated { version } => {
+            let _ = write!(b, "<p class=\"ok\">Updated to version {}.</p>", esc(version));
+        }
+        Progress::Idle | Progress::UpToDate { .. } => {}
+    }
+    if let Some(app) = newer.filter(|_| !u.app.busy()) {
+        let _ = write!(
+            b,
+            "<p class=\"warn\">An app update is available: {}</p>\
+             <form method=\"post\" action=\"/_system/app/update\"><button>Update the app</button></form>",
+            esc(&app.version)
+        );
+    }
+    b.push_str("</section>");
+    b
+}
+
 /// "Update available" / "up to date" from the release manifest
 fn availability(u: &Updates, running: &str) -> String {
     if !u.checks_configured {
@@ -129,23 +197,25 @@ fn availability(u: &Updates, running: &str) -> String {
     b
 }
 
-fn tailscale_update_line(update: &Update) -> String {
+fn tailscale_update_line(update: &Progress) -> String {
     let button = "<form method=\"post\" action=\"/_system/tailscale/update\">\
                   <button>Check for a Tailscale update</button></form>";
     match update {
-        Update::Idle => button.to_owned(),
-        Update::Checking => "<p class=\"muted\">Checking for a newer version…</p>".to_owned(),
-        Update::Downloading { version, percent } => {
+        Progress::Idle => button.to_owned(),
+        Progress::Checking => "<p class=\"muted\">Checking for a newer version…</p>".to_owned(),
+        Progress::Downloading { version, percent } => {
             format!("<p class=\"warn\">Downloading Tailscale {}: {percent}%</p>", esc(version))
         }
-        Update::Installing { version } => {
+        Progress::Installing { version } => {
             format!("<p class=\"warn\">Installing Tailscale {}…</p>", esc(version))
         }
-        Update::Updated { version } => format!("<p class=\"ok\">Updated to Tailscale {}.</p>", esc(version)),
-        Update::UpToDate { version } => {
+        Progress::Updated { version } => {
+            format!("<p class=\"ok\">Updated to Tailscale {}.</p>", esc(version))
+        }
+        Progress::UpToDate { version } => {
             format!("<p class=\"ok\">Tailscale {} is the latest version.</p>{button}", esc(version))
         }
-        Update::Failed { error } => {
+        Progress::Failed { error } => {
             format!("<p class=\"warn\">Tailscale wasn't updated: {}</p>{button}", esc(error))
         }
     }
@@ -189,25 +259,37 @@ pub fn status(s: &Status, updates: &Updates) -> String {
         esc(ts.version.as_deref().unwrap_or("unknown")),
         tailscale_update_line(updates.tailscale),
     );
+    if ts.backend_state.as_deref() == Some("Running")
+        && let Some(error) = updates.serve.error.as_deref()
+    {
+        let _ = write!(
+            b,
+            "<section><h2>Opening the app over Tailscale</h2><p class=\"warn\">Not working yet. \
+             In the Tailscale admin console, open the DNS page and turn on MagicDNS and HTTPS \
+             certificates. The box retries every minute.</p><p class=\"muted\">{}</p></section>",
+            esc(error)
+        );
+    }
 
     // Storage
     let storage = match &s.data {
         Some(d) => format!("<p>{} free of {}</p>", gib(d.free_bytes), gib(d.total_bytes)),
         None => "<p class=\"warn\">The data area isn't available.</p>".to_owned(),
     };
+    b.push_str(&app_section(s, updates));
     let _ = write!(b, "<section><h2>Storage</h2>{storage}</section>");
     b.push_str(&update_section(updates, &s.os.version));
 
     b.push_str(
-        "<p class=\"muted\"><a href=\"/\">Open the app</a> · \
-         <a href=\"/_system/password\">Change password</a></p>\
+        "<p class=\"muted\"><a href=\"/_system/password\">Change password</a></p>\
          <form method=\"post\" action=\"/_system/logout\"><button>Sign out</button></form>",
     );
     let busy = matches!(updates.install, Install::Running { .. })
         || updates.manifest.checking
+        || updates.app.busy()
         || matches!(
             updates.tailscale,
-            Update::Checking | Update::Downloading { .. } | Update::Installing { .. }
+            Progress::Checking | Progress::Downloading { .. } | Progress::Installing { .. }
         );
     let refresh = busy.then_some((3, "/_system/"));
     page_refreshing("Box", &b, refresh)
@@ -276,6 +358,23 @@ pub fn set_password(first_run: bool, error: Option<&str>) -> String {
     )
 }
 
+/// What the home network sees outside /_system/: the app is only on the tailnet
+pub fn app_on_tailnet(dns_name: Option<&str>) -> String {
+    let link = match dns_name {
+        Some(name) => format!("<p><a href=\"https://{0}/\">Open https://{0}/</a></p>", esc(name)),
+        None => "<p>Connect Tailscale on the <a href=\"/_system/\">box's page</a> first.</p>".to_owned(),
+    };
+    page(
+        "Open the app over Tailscale",
+        &format!(
+            "<h1>Open the app over Tailscale</h1>\
+             <p>For privacy, the app is only reachable through Tailscale (with HTTPS), \
+             from devices signed in to your tailnet.</p>{link}\
+             <p class=\"muted\">The box's own settings are at <a href=\"/_system/\">/_system/</a>.</p>"
+        ),
+    )
+}
+
 pub fn app_down() -> String {
     page(
         "App not running",
@@ -311,14 +410,19 @@ mod tests {
             },
             data: Some(Disk { total_bytes: 30_000_000_000, free_bytes: 29_500_000_000 }),
             uptime_seconds: 3 * 3600 + 5 * 60,
+            app_running: true,
         };
         let html = status(
             &s,
             &Updates {
                 install: &Install::Idle,
-                tailscale: &Update::Idle,
+                tailscale: &Progress::Idle,
                 manifest: &Check::default(),
                 checks_configured: false,
+                app: &Progress::Idle,
+                app_installed: None,
+                app_initial_password: None,
+                serve: &Default::default(),
             },
         );
         assert!(!html.contains("<script>") && html.contains("&lt;script&gt;"));
@@ -329,7 +433,16 @@ mod tests {
     }
 
     fn section(install: &Install, manifest: &Check) -> String {
-        let u = Updates { install, tailscale: &Update::Idle, manifest, checks_configured: true };
+        let u = Updates {
+            install,
+            tailscale: &Progress::Idle,
+            manifest,
+            checks_configured: true,
+            app: &Progress::Idle,
+            app_installed: None,
+            app_initial_password: None,
+            serve: &Default::default(),
+        };
         update_section(&u, "2026.10.19.2244-g77ccad4")
     }
 
@@ -364,6 +477,49 @@ mod tests {
         let failed =
             section(&Install::Idle, &Check { error: Some("offline <x>".into()), ..Default::default() });
         assert!(failed.contains("offline &lt;x&gt;") && failed.contains("Check now"));
+    }
+
+    #[test]
+    fn app_section_offers_updates_and_first_login() {
+        use crate::manifest::{AppRelease, Manifest};
+        let status = |dns: Option<&str>| Status {
+            os: Default::default(),
+            tailscale: Tailscale { dns_name: dns.map(Into::into), ..Default::default() },
+            data: None,
+            uptime_seconds: 0,
+            app_running: true,
+        };
+        let manifest = Check {
+            latest: Some(Manifest {
+                schema: 1,
+                os: None,
+                app: Some(AppRelease {
+                    name: "kid-phone-server".into(),
+                    version: "0.19.0".into(),
+                    url: "https://x/a.tgz".into(),
+                    sha256: "00".into(),
+                    command: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let updates = |installed: Option<&'static str>, password: Option<&'static str>| Updates {
+            install: &Install::Idle,
+            tailscale: &Progress::Idle,
+            manifest: Box::leak(Box::new(manifest.clone())),
+            checks_configured: true,
+            app: &Progress::Idle,
+            app_installed: installed,
+            app_initial_password: password,
+            serve: Box::leak(Box::new(crate::tailscale_serve::Serve { configured: true, error: None })),
+        };
+        let html = app_section(&status(Some("box.tail1.ts.net")), &updates(Some("0.18.6"), Some("Ab<c")));
+        assert!(html.contains("0.18.6 is running") && html.contains("An app update is available: 0.19.0"));
+        assert!(html.contains("password <b>Ab&lt;c</b>") && html.contains("https://box.tail1.ts.net/"));
+        let current = app_section(&status(None), &updates(Some("0.19.0"), None));
+        assert!(!current.contains("update is available") && !current.contains("First sign-in"));
+        let fresh = app_section(&status(None), &updates(None, None));
+        assert!(fresh.contains("Not installed yet") && !fresh.contains("update is available"));
     }
 
     #[test]

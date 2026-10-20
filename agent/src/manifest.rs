@@ -39,6 +39,15 @@ pub struct AppRelease {
     pub url: String,
     /// Lowercase hex SHA-256 of the tarball at `url`
     pub sha256: String,
+    /// The binary inside the tarball; defaults to the name with - as _
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+impl AppRelease {
+    pub fn command(&self) -> String {
+        self.command.clone().unwrap_or_else(|| self.name.replace('-', "_"))
+    }
 }
 
 #[derive(Serialize, Clone, Debug, Default, PartialEq)]

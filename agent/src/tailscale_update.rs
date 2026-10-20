@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex};
 use base64::Engine;
 use blake2::Blake2s256;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use serde::Serialize;
 
 const ROOT_KEYS: [&str; 2] = [
     include_str!("tailscale-roots/crawshaw-root.pem"),
@@ -28,23 +27,7 @@ const MAX_TARBALL: u64 = 200 << 20;
 /// Space needed on /data: the download plus the unpacked binaries
 const MIN_FREE_SPACE: u64 = 250 << 20;
 
-#[derive(Serialize, Clone, Debug, PartialEq)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum Update {
-    Idle,
-    Checking,
-    Downloading { version: String, percent: u8 },
-    Installing { version: String },
-    Updated { version: String },
-    UpToDate { version: String },
-    Failed { error: String },
-}
-
-impl Update {
-    fn busy(&self) -> bool {
-        matches!(self, Update::Checking | Update::Downloading { .. } | Update::Installing { .. })
-    }
-}
+use crate::progress::Progress;
 
 pub struct Config {
     /// e.g. https://pkgs.tailscale.com
@@ -75,15 +58,15 @@ impl Config {
 #[derive(Clone)]
 pub struct TailscaleUpdate {
     config: Arc<Config>,
-    state: Arc<Mutex<Update>>,
+    state: Arc<Mutex<Progress>>,
 }
 
 impl TailscaleUpdate {
     pub fn new(config: Config) -> Self {
-        Self { config: Arc::new(config), state: Arc::new(Mutex::new(Update::Idle)) }
+        Self { config: Arc::new(config), state: Arc::new(Mutex::new(Progress::Idle)) }
     }
 
-    pub fn state(&self) -> Update {
+    pub fn state(&self) -> Progress {
         self.state.lock().unwrap().clone()
     }
 
@@ -94,7 +77,7 @@ impl TailscaleUpdate {
             if state.busy() {
                 return false;
             }
-            *state = Update::Checking;
+            *state = Progress::Checking;
         }
         let (config, state) = (self.config.clone(), self.state.clone());
         tokio::spawn(async move {
@@ -104,7 +87,7 @@ impl TailscaleUpdate {
                 .unwrap_or_else(|e| Err(format!("updater crashed: {e}")));
             *state.lock().unwrap() = match outcome {
                 Ok(done) => done,
-                Err(error) => Update::Failed { error },
+                Err(error) => Progress::Failed { error },
             };
         });
         true
@@ -203,8 +186,8 @@ fn free_space(path: &Path) -> Option<u64> {
     (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
 }
 
-fn update(config: &Config, state: &Mutex<Update>) -> Result<Update, String> {
-    let set = |s: Update| *state.lock().unwrap() = s;
+fn update(config: &Config, state: &Mutex<Progress>) -> Result<Progress, String> {
+    let set = |s: Progress| *state.lock().unwrap() = s;
     let base = config.pkgs.trim_end_matches('/');
 
     let index = crate::http::get(&format!("{base}/{}/?mode=json", config.track), 1 << 20)?;
@@ -217,7 +200,7 @@ fn update(config: &Config, state: &Mutex<Update>) -> Result<Update, String> {
         .unwrap_or_else(|| format!("tailscale_{latest}_arm64.tgz"));
     let running = running_version(&config.cli).unwrap_or_default();
     if version_numbers(&latest) <= version_numbers(&running) {
-        return Ok(Update::UpToDate { version: running });
+        return Ok(Progress::UpToDate { version: running });
     }
 
     let bundle = crate::http::get(&format!("{base}/distsign.pub"), 64 << 10)?;
@@ -229,17 +212,17 @@ fn update(config: &Config, state: &Mutex<Update>) -> Result<Update, String> {
         return Err("not enough free space on the data partition".into());
     }
     let download_path = config.releases.join(format!(".download-{latest}.tgz"));
-    set(Update::Downloading { version: latest.clone(), percent: 0 });
+    set(Progress::Downloading { version: latest.clone(), percent: 0 });
     let url = format!("{base}/{}/{tarball}", config.track);
     let result = crate::http::download::<Blake2s256>(&url, &download_path, MAX_TARBALL, |percent| {
-        set(Update::Downloading { version: latest.clone(), percent });
+        set(Progress::Downloading { version: latest.clone(), percent });
     })
     .and_then(|(hash, len)| {
         let sig = crate::http::get(&format!("{url}.sig"), 1 << 10)?;
         if !verify_any(&keys, &package_message(&hash, len), &sig) {
             return Err("the download's signature doesn't check out; nothing was installed".into());
         }
-        set(Update::Installing { version: latest.clone() });
+        set(Progress::Installing { version: latest.clone() });
         unpack(&download_path, &latest, &config.releases)
     });
     let _ = std::fs::remove_file(&download_path);
@@ -250,7 +233,7 @@ fn update(config: &Config, state: &Mutex<Update>) -> Result<Update, String> {
         .status()
         .map_err(|e| format!("couldn't start {}: {e}", config.activate.display()))?;
     match status.code() {
-        Some(0) => Ok(Update::Updated { version: latest }),
+        Some(0) => Ok(Progress::Updated { version: latest }),
         Some(1) => Err(format!("Tailscale {latest} didn't start, so the previous version was kept")),
         _ => Err(format!("Tailscale {latest} couldn't be installed")),
     }
@@ -361,7 +344,7 @@ mod tests {
         }
     }
 
-    async fn finish(u: &TailscaleUpdate) -> Update {
+    async fn finish(u: &TailscaleUpdate) -> Progress {
         for _ in 0..200 {
             let s = u.state();
             if !s.busy() {
@@ -379,7 +362,7 @@ mod tests {
         let u = TailscaleUpdate::new(config(dir.path(), pkgs, root, "1.104.1", 0));
         assert!(u.start());
         assert!(!u.start(), "only one update at a time");
-        assert_eq!(finish(&u).await, Update::Updated { version: "1.200.0".into() });
+        assert_eq!(finish(&u).await, Progress::Updated { version: "1.200.0".into() });
         let rel = dir.path().join("releases/1.200.0");
         assert_eq!(std::fs::read_to_string(rel.join("VERSION")).unwrap(), "1.200.0\n");
         let mode = std::fs::metadata(rel.join("tailscaled")).unwrap().permissions().mode();
@@ -396,7 +379,7 @@ mod tests {
         let (pkgs, root) = fake_pkgs("1.200.0", true).await;
         let u = TailscaleUpdate::new(config(dir.path(), pkgs, root, "1.104.1", 0));
         u.start();
-        let Update::Failed { error } = finish(&u).await else { panic!("expected failure") };
+        let Progress::Failed { error } = finish(&u).await else { panic!("expected failure") };
         assert!(error.contains("signature"), "{error}");
         assert!(!dir.path().join("releases/1.200.0").exists());
         assert!(!dir.path().join("activated").exists(), "nothing was activated");
@@ -409,7 +392,7 @@ mod tests {
         let stranger = SigningKey::from_bytes(&[9; 32]).verifying_key();
         let u = TailscaleUpdate::new(config(dir.path(), pkgs, stranger, "1.104.1", 0));
         u.start();
-        let Update::Failed { error } = finish(&u).await else { panic!("expected failure") };
+        let Progress::Failed { error } = finish(&u).await else { panic!("expected failure") };
         assert!(error.contains("root key"), "{error}");
     }
 
@@ -419,7 +402,7 @@ mod tests {
         let (pkgs, root) = fake_pkgs("1.104.1", false).await;
         let u = TailscaleUpdate::new(config(dir.path(), pkgs, root, "1.104.1", 0));
         u.start();
-        assert_eq!(finish(&u).await, Update::UpToDate { version: "1.104.1".into() });
+        assert_eq!(finish(&u).await, Progress::UpToDate { version: "1.104.1".into() });
     }
 
     #[tokio::test]
@@ -428,7 +411,7 @@ mod tests {
         let (pkgs, root) = fake_pkgs("1.200.0", false).await;
         let u = TailscaleUpdate::new(config(dir.path(), pkgs, root, "1.104.1", 1));
         u.start();
-        let Update::Failed { error } = finish(&u).await else { panic!("expected failure") };
+        let Progress::Failed { error } = finish(&u).await else { panic!("expected failure") };
         assert!(error.contains("previous version was kept"), "{error}");
     }
 }

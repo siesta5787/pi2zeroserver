@@ -74,7 +74,8 @@ pub async fn forward(
     if let Ok(v) = HeaderValue::from_str(&forwarded_for) {
         headers.insert("x-forwarded-for", v);
     }
-    headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+    // Only the tailnet front proxies, and it's only reached through tailscale serve over HTTPS
+    headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
 
     match proxy.client.request(req).await {
         Ok(resp) => {
