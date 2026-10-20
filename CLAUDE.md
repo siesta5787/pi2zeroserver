@@ -1,8 +1,31 @@
 # CLAUDE.md
 
 Buildroot-based A/B-updating appliance OS for the Raspberry Pi Zero 2 W: runs a
-static musl Rust web server plus Tailscale, kept up to date by a non-technical
-user from a web page. Design, decisions and step status: `PLAN.md`.
+static musl Rust web server (kid-phone-server, a separate repo) plus Tailscale,
+kept up to date by a non-technical user from a web page. Design, decisions and
+step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
+
+## How the box fits together
+
+- `agent/` (Rust, `box-agent`, in the read-only image) is the front door:
+  - port 80 on the home LAN: `/_system/` only (setup, status, updates, behind the
+    admin password); other paths say "open the app over Tailscale";
+  - `127.0.0.1:8081`, the tailnet front: `/_system/` plus a reverse proxy to the
+    app (127.0.0.1:3100) with `X-Forwarded-Proto: https`. The agent publishes it
+    with `tailscale serve --bg --https=443` once Tailscale is connected;
+  - `/run/box/api.sock` (root:app 0660): the box API for the app.
+  Only `/_system/api/health` is public; localhost gets no special trust.
+- State on `/data`: `agent/` (admin password), `iwd/`, `tailscale/{state,releases,
+  current}`, `rauc/`, `timesync/`, `app/{releases,current,state,run,env,snapshots}`.
+- Activation scripts in `/usr/libexec/box/` do the switch-and-health-check for
+  things updated on `/data`; the agent downloads and verifies, then calls them.
+  Exit status 0 activated, 1 failed and rolled back, 2 release unusable:
+  `tailscale-activate <v>`, `app-activate <v>` (snapshots and restores the app's
+  SQLite files too, since a newer app may migrate the DB).
+- Trust: OS bundles are checked by RAUC (`local/rauc` key), the release manifest
+  by the agent (`local/manifest` key, pinned in `/etc/box/manifest-key.pub`), the
+  app by the manifest's SHA-256, Tailscale by its distsign chain from the root
+  keys in `agent/src/tailscale-roots/`.
 
 ## Building
 
@@ -31,9 +54,9 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
   - changed a package's `_DEPENDENCIES` → `<pkg>-dirclean` (`-rebuild` doesn't
     refresh its per-package sysroot, so new libraries stay invisible)
   - `agent/` sources → `./build.sh dev box-agent-rebuild` (local package; Buildroot
-    re-copies it only on rebuild). Run `cargo test` in `agent/` first: the agent
-    targets Rust 1.88 (Buildroot's), so keep `rust-version` and let Cargo pick
-    compatible crate versions.
+    re-copies it only on rebuild). Run `cargo fmt`, `cargo clippy --all-targets`
+    and `cargo test` in `agent/` first: the agent targets Rust 1.88 (Buildroot's),
+    so keep `rust-version` and let Cargo pick compatible crate versions.
 - The project drive is a USB disk. After long builds, check
   `journalctl -k --since <build start> | grep -E "sdc|usb .*reset|I/O error"`.
   If writes failed, dirclean the packages built in that window: they can
@@ -41,14 +64,21 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
 
 ## Testing
 
-- `tools/qemu-ab-test.py` boots the image in QEMU (raspi3b, same SoC) and checks
-  first boot on slot A (marked good, read-only root, /data grown), a power cut,
-  a signed install into slot B, booting B with the same /data, and rollback
-  from a broken B. Run it after anything
-  touching boot, U-Boot, RAUC, the kernel or systemd units. It runs ~20 min:
-  launch it detached like a build. Its docstring lists the QEMU-only
-  adaptations (U-Boot image header, pinmux, watchdog); keep production files
-  free of QEMU workarounds.
+- `tools/qemu-ab-test.py` boots the image in QEMU (raspi3b, same SoC) and runs
+  ~60 checks: first boot on slot A (marked good, read-only root, /data grown),
+  agent login and APIs, Tailscale activate/rollback, a power cut, the real
+  kid-phone-server binary (fetched from GitHub on this machine) with a broken
+  update rolled back, a signed OS install into slot B through the agent, and
+  rollback from a broken B. Run it after anything touching boot, U-Boot, RAUC,
+  the kernel, systemd units or the agent. It takes ~25 min: launch it detached
+  like a build. Its docstring lists the QEMU-only adaptations (U-Boot image
+  header, pinmux, watchdog); keep production files free of QEMU workarounds.
+  A failed run keeps its card as `qemu-ab-test/sdcard.failed.img`.
+- Watching long runs: the test reads its script once at start, so editing it
+  while a run is going is safe once `qemu-ab-test.result` exists. Services
+  report "active" before they're listening: poll for the port, don't check once.
+  `pgrep -f`/`pkill -f` also match your own command line (`[q]emu` patterns help),
+  and a monitor started alongside a launch can read the previous run's files.
 - Real device (dev builds): `sudo tools/set-wifi.sh /media/$USER/data` puts
   Wi-Fi on a flashed card's data partition; `tools/serve-updates.py` serves bundles for
   `rauc install http://<pc>:8000/<bundle>` (RAUC streaming needs HTTP Range
@@ -57,11 +87,18 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
 
 ## Releasing
 
+- Commit first, then build: the version (`YYYY.MM.DD.HHMM-g<commit>`) gets
+  `-dirty` from uncommitted changes, and `tools/publish-release.sh` refuses those.
 - `tools/publish-release.sh [--app-tag vX.Y.Z] [--dry-run]` publishes the current
   build's OS bundle plus a signed `manifest.json` (also pinning a kid-phone-server
   release by SHA-256) as a GitHub release of this (public) repo. Devices poll
-  `releases/latest/download/manifest.json`. Refuses `-dirty` builds unless
-  `--allow-dirty`. Use `--dry-run` to inspect the manifest first.
+  `releases/latest/download/manifest.json` (+ `.sig`) a minute after boot and
+  every ~12 h. Use `--dry-run` to inspect the manifest first. Afterwards, fetch
+  the manifest from that URL and verify it against the image's
+  `/etc/box/manifest-key.pub`, like a device would.
+- Releases so far are signed with the dev keys in `local/`; a release key and a
+  release defconfig come with step 7. First published: `v2026.10.20.0316-gcdbc7c3`
+  (pins kid-phone-server v0.18.6).
 - The app (kid-phone-server, separate repo) is never built here; the manifest
   just pins one of its releases. See PLAN.md "The app".
 
@@ -85,6 +122,19 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
   systemd-networkd-wait-online, which fails after ~2 min whenever there's no
   network (before Wi-Fi setup, in QEMU) and leaves the system degraded. Use
   `network.target` and let services cope without a network.
+- The agent must wait for `/data` (`RequiresMountsFor`) and only offers first-time
+  password setup while `/data` is mounted; otherwise a slow mount (fsck after a
+  power cut) looks like a brand-new box and anyone on the LAN could claim it.
+- curl-sys silently builds its own curl without HTTPS when pkg-config can't find
+  the system libcurl; `box-agent.mk` refuses to install a binary that doesn't
+  link `libcurl.so`.
+- Files that outlive OS updates must belong to users with fixed IDs
+  (`users.table`, e.g. `app` 950); Buildroot's automatic IDs can shift between
+  builds.
+- BusyBox `wget` re-POSTs on redirects and hides `Set-Cookie`; the dev image has
+  the `curl` command for tests and debugging (to be dropped from release images).
+- The tar crate skips archive entries with `..` instead of failing; nothing
+  escapes, but don't rely on an error to detect hostile archives.
 - No RTC: `/usr/lib/clock-epoch` (stamped in `post-build.sh`) keeps the clock at
   least at build time, or offline devices reject bundle signatures.
 
@@ -97,9 +147,12 @@ user from a web page. Design, decisions and step status: `PLAN.md`.
   reflashing dev devices. Never commit anything from `local/` except the README
   and example. The repo is public: audit history before pushing anything secret-
   looking.
-- Release builds will require `BOX_RAUC_KEY`/`BOX_RAUC_CERT` from outside the repo.
+- Release builds will require `BOX_RAUC_KEY`/`BOX_RAUC_CERT` and `BOX_MANIFEST_KEY`
+  from outside the repo.
 
 ## Git
 
 - Commit identity is set repo-locally (GitHub noreply address). Remote:
-  `github.com/siesta5787/pi2zeroserver` (private), branch `main`.
+  `github.com/siesta5787/pi2zeroserver` (public since 2026-10-19), branch `main`.
+  Releases are published there too. The app lives in
+  `github.com/siesta5787/kid-phone-server`; this repo doesn't change it.
