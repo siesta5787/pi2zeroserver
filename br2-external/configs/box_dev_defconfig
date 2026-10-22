@@ -45,6 +45,11 @@ BR2_PACKAGE_KMOD=y
 BR2_PACKAGE_UTIL_LINUX_BINARIES=y
 BR2_PACKAGE_UTIL_LINUX_PARTX=y
 BR2_PACKAGE_IWD=y
+# Setup hotspot (iwd's access point mode doesn't work with brcmfmac)
+BR2_PACKAGE_HOSTAPD=y
+# BR2_PACKAGE_HOSTAPD_DRIVER_HOSTAP is not set
+# BR2_PACKAGE_HOSTAPD_ACS is not set
+# BR2_PACKAGE_HOSTAPD_VLAN is not set
 # curl command (dev builds: debugging, and cookie logins in tools/qemu-ab-test.py)
 BR2_PACKAGE_LIBCURL_CURL=y
 BR2_PACKAGE_RAUC=y

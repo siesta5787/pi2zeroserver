@@ -26,7 +26,7 @@ reflashing, no terminal. Flashing the SD card is the hardest step.
 | Update framework | RAUC | Included in Buildroot, signed bundles, streams straight to the spare slot (512 MB RAM), D-Bus API |
 | Bootloader | U-Boot + bootcount | Proven A/B on the Zero 2 W; env stored redundantly in the raw gap |
 | Init | systemd | Watchdog, restart, sandboxing, timesyncd (no RTC), networkd, mDNS via resolved |
-| Wi-Fi | iwd | Small, D-Bus, built-in AP mode; ship both 43436 and 43436s firmware |
+| Wi-Fi | iwd (+ hostapd for the setup hotspot) | Small, D-Bus; iwd's AP mode doesn't work on brcmfmac, so the hotspot uses hostapd |
 | Rootfs | ext4, mounted read-only | U-Boot can read it; survives power loss |
 | App/Tailscale | `/data`, fallback in rootfs | Updates without full OS images; static binaries don't depend on the OS |
 
@@ -52,7 +52,7 @@ Browser ──(LAN http://box.local  or  https://box.<tailnet>.ts.net via tailsc
    ├─ /_system/*   setup · updates · Wi-Fi · status · password
    ├─ /*           proxied to the app on 127.0.0.1:8080
    ├─ RAUC  (D-Bus)       OS install, mark-good
-   ├─ iwd   (D-Bus)       Wi-Fi scan/join, setup AP
+   ├─ iwd   (D-Bus)       Wi-Fi scan/join; hostapd for the setup AP
    ├─ tailscale CLI --json  login link, status, version swap
    └─ health checks + rollback for all three
 app        /data/app/current → releases/<ver>/   (unprivileged, sandboxed, 127.0.0.1 only)
@@ -90,9 +90,10 @@ explicit choice.
 ## First-time setup
 
 1. Flash the `.img.xz` with Raspberry Pi Imager (custom repo JSON so it's listed).
-2. No Wi-Fi saved → the agent switches iwd to access point mode: `Box-Setup-XXXX`
-   (end of the MAC), WPA2 password `boxsetup` (iwd's AP can't run open; the
-   password is fixed and published since the box has no screen or label).
+2. No Wi-Fi saved → the agent starts hostapd (`box-hotspot.service`, which stops
+   iwd: they can't share the radio, and iwd's own AP mode fails on brcmfmac):
+   `Box-Setup-XXXX` (end of the MAC), WPA2 password `boxsetup` (fixed and
+   published since the box has no screen or label).
    networkd gives it 192.168.4.1 and DHCP; the agent answers all DNS with
    192.168.4.1 and redirects other web requests to `/_system/`, so phones show
    their "sign in to network" prompt.
@@ -251,10 +252,12 @@ RPi Server DIstro/          (this folder, git)
      passwords written as iwd network files on /data, restored if the join
      fails (and the box rejoins the network it was on). Setup hotspot with
      DHCP and captive portal (DNS + redirect), fallback hotspot when offline.
+     The hotspot runs on hostapd: iwd's AP mode failed on the real Pi
+     (brcmfmac rejects its START_AP).
      "Connect Tailscale" with sign-in link and QR code. QEMU test runs it on
      three mac80211_hwsim radios (box, home AP, phone).
-     Still to verify on the Pi: iwd AP mode on brcmfmac, phones' captive
-     portal prompts, the Tailscale sign-in with internet.
+     Still to verify on the Pi: hostapd hotspot, phones' captive portal
+     prompts, the Tailscale sign-in with internet.
    - 6b: factory reset and forgotten-password recovery; box name.
 7. Hardening: firewall, sandboxing, release defconfig (no curl CLI, no HDMI
    console login, release signing key).

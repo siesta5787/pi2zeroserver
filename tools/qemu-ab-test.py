@@ -10,8 +10,9 @@ Boots a copy of the dev sdcard.img and checks:
 Along the way: the built-in Tailscale runs, a newer release activates from
 /data (and survives the OS update), and a broken release rolls back; the real
 app runs and a broken app update rolls back; and on virtual Wi-Fi radios
-(mac80211_hwsim) the setup hotspot starts with no saved network, a "phone"
-joins it, and the box joins a "home" network from it (wrong password first).
+(mac80211_hwsim) the setup hotspot (hostapd) starts with no saved network, a
+"phone" joins it, and the box joins a "home" network from it (wrong password
+first).
 
 QEMU has no Raspberry Pi firmware and a few emulation gaps, so the test builds
 adapted copies of a few pieces. Everything else is the production build:
@@ -513,40 +514,42 @@ def wait_addr(con, iface, prefix, timeout=60):
 
 def check_wifi(con):
     """Setup hotspot and joining networks, on three virtual radios: wlan0 is the
-    box's, wlan1 plays the home Wi-Fi (an iwd access point), wlan2 a phone."""
-    con.sh("modprobe mac80211_hwsim radios=3")
+    box's, wlan1 plays the home Wi-Fi (a test hostapd), wlan2 a phone. The
+    system's iwd is told to leave wlan1 and wlan2 alone (test-only drop-in)."""
     con.sh(WIFI_HELPERS)
-    # Test-only addressing for the home network and the phone (gone after a restart)
-    con.sh("mkdir -p /run/systemd/network && "
+    con.sh("mkdir -p /run/systemd/system/iwd.service.d /run/systemd/network && "
+           "printf '[Service]\\nExecStart=\\nExecStart=/usr/libexec/iwd -I wlan1,wlan2\\n' "
+           "> /run/systemd/system/iwd.service.d/test.conf && systemctl daemon-reload && systemctl restart iwd && "
            "printf '[Match]\\nName=wlan1\\n[Network]\\nAddress=192.168.50.1/24\\nDHCPServer=yes\\n"
            "LinkLocalAddressing=no\\n' > /run/systemd/network/05-test-home.network && "
            "printf '[Match]\\nName=wlan2\\n[Network]\\nDHCP=ipv4\\nLinkLocalAddressing=no\\n' "
            "> /run/systemd/network/05-test-phone.network && networkctl reload")
-    rc, out = con.sh("for i in $(seq 30); do busctl get-property net.connman.iwd $(iwdev wlan2) "
-                     "net.connman.iwd.Device Name >/dev/null 2>&1 && break; sleep 1; done; "
-                     "busctl get-property net.connman.iwd $(iwdev wlan2) net.connman.iwd.Device Name",
-                     timeout=120, check=False)
-    check("iwd sees the virtual radios", rc == 0, out[-200:])
-    rc, out = con.sh("busctl set-property net.connman.iwd $(iwdev wlan1) net.connman.iwd.Device Mode s ap "
-                     "&& sleep 2 && busctl call net.connman.iwd $(iwdev wlan1) net.connman.iwd.AccessPoint "
-                     "Start ss TestHome test-home-pw", check=False)
+    con.sh("modprobe mac80211_hwsim radios=3")
+    rc, out = con.sh("for i in $(seq 30); do [ -e /sys/class/net/wlan2 ] && break; sleep 1; done; "
+                     "printf 'interface=wlan1\\ndriver=nl80211\\nssid=TestHome\\nhw_mode=g\\nchannel=1\\nwpa=2\\n"
+                     "wpa_key_mgmt=WPA-PSK\\nrsn_pairwise=CCMP\\nwpa_passphrase=test-home-pw\\n' > /run/test-home.conf "
+                     "&& hostapd -B -P /run/test-home.pid /run/test-home.conf", timeout=120, check=False)
     check("test home network up", rc == 0, out[-300:])
 
     cookie = agent_post(con, "/_system/login", f"password={ADMIN_PASSWORD}")
     view = wait_wifi(con, cookie, lambda v: v.get("available"), 60)
     check("agent finds the Wi-Fi", view.get("available") is True, str(view)[:300])
-    # A dev card comes with the developer's Wi-Fi saved: forget it, like a fresh box
+    # A dev card may come with the developer's Wi-Fi saved: forget it, like a fresh box
     for name in view.get("saved", []):
         agent_api(con, "/_system/wifi/forget", cookie, f"name={urllib.parse.quote_plus(name)}")
     view = wait_wifi(con, cookie, lambda v: (v.get("hotspot") or {}).get("setup"), 120)
+    if not any(n.get("name") == "TestHome" for n in view.get("networks", [])):
+        # The hotspot came up before the home network did; its list is from before
+        con.sh("systemctl start iwd")
+        view = wait_wifi(con, cookie, lambda v: v.get("hotspot")
+                         and any(n.get("name") == "TestHome" for n in v.get("networks", [])), 120)
     hotspot = (view.get("hotspot") or {}).get("ssid", "")
     check("no saved Wi-Fi: setup hotspot starts", hotspot.startswith("Box-Setup-") and not view.get("saved"),
           str(view)[:300])
+    rc, out = con.sh("systemctl is-active box-hotspot iwd", check=False)
+    check("hostapd runs the hotspot, iwd stepped aside", out.split()[-2:] == ["active", "inactive"], out)
     out = wait_addr(con, "wlan0", "192.168.4.1/24")
     check("hotspot has its address", "inet 192.168.4.1/24" in out, out[-200:])
-    if not any(n.get("name") == "TestHome" for n in view.get("networks", [])):
-        agent_api(con, "/_system/wifi/scan", cookie, "")
-        view = wait_wifi(con, cookie, lambda v: any(n.get("name") == "TestHome" for n in v.get("networks", [])), 60)
     check("hotspot lists the networks around", any(n.get("name") == "TestHome" for n in view.get("networks", [])),
           str(view.get("networks")))
     rc, out = con.sh("nslookup connectivitycheck.gstatic.com 192.168.4.1", check=False)
@@ -557,16 +560,19 @@ def check_wifi(con):
     check("phones checking for internet land on the setup page",
           out.splitlines()[-1:] == ["302 http://192.168.4.1/_system/"], out[-200:])
 
-    # The phone joins the hotspot (its password is the published one) and gets an address
-    con.sh(f"printf '[Security]\\nPassphrase=boxsetup\\n' > /data/iwd/{hotspot}.psk; "
+    # The phone (its own iwd, on wlan2 only) joins with the published password and gets an address
+    con.sh("mkdir -p /var/lib/iwd; /usr/libexec/iwd -i wlan2 >/dev/null 2>&1 & echo $! > /run/test-iwd.pid")
+    con.sh(f"printf '[Security]\\nPassphrase=boxsetup\\n' > /var/lib/iwd/{hotspot}.psk; "
+           "for i in $(seq 20); do busctl get-property net.connman.iwd $(iwdev wlan2) net.connman.iwd.Station "
+           "State >/dev/null 2>&1 && break; sleep 1; done; "
            "busctl call net.connman.iwd $(iwdev wlan2) net.connman.iwd.Station Scan; sleep 10; "
            f"busctl --timeout=60 call net.connman.iwd $(iwdev wlan2)/$(hexssid {hotspot})_psk "
            "net.connman.iwd.Network Connect", timeout=120, check=False)
     out = wait_addr(con, "wlan2", "192.168.4.")
     check("a phone joins the hotspot and gets an address from it", "inet 192.168.4." in out, out[-300:])
-    con.sh(f"busctl call net.connman.iwd $(iwdev wlan2) net.connman.iwd.Station Disconnect; "
-           f"rm -f /data/iwd/{hotspot}.psk; busctl set-property net.connman.iwd $(iwdev wlan2) "
-           "net.connman.iwd.Device Powered b false", check=False)
+    rc, out = con.sh("hostapd_cli -p /run/box-hotspot -i wlan0 list_sta", check=False)
+    check("hostapd lists the phone", any(len(l.strip()) == 17 for l in out.splitlines()), out[-200:])
+    con.sh(f"kill $(cat /run/test-iwd.pid); sleep 2; rm -f /var/lib/iwd/{hotspot}.psk", check=False)
 
     # Joining the home network from the hotspot: a typo first
     code, body = agent_api(con, "/_system/wifi/join", cookie, "ssid=TestHome&password=wrong-password")
@@ -582,6 +588,8 @@ def check_wifi(con):
                      and v.get("join", {}).get("state") == "joined", 240)
     check("the box joins the home network from the hotspot",
           view.get("connected") == "TestHome" and not view.get("hotspot"), str(view)[:400])
+    rc, out = con.sh("systemctl is-active box-hotspot iwd", check=False)
+    check("hotspot off, iwd back", out.split()[-2:] == ["inactive", "active"], out)
     out = wait_addr(con, "wlan0", "192.168.50.")
     check("the box gets an address on the home network", "inet 192.168.50." in out and "192.168.4.1" not in out,
           out[-300:])

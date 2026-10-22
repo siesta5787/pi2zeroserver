@@ -18,10 +18,15 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
 - Wi-Fi (`agent/src/wifi.rs`): the agent drives iwd with `busctl --json` (no
   D-Bus crate). Joining writes the password as an iwd network file in
   `/data/iwd` and calls `Network.Connect` (no iwd agent). With no saved network,
-  or offline for 3 min, it switches wlan0 to AP mode: `Box-Setup-XXXX`, password
-  `boxsetup`, 192.168.4.1 with networkd's DHCP server (`10-setup-hotspot.network`,
+  or offline for 3 min, it starts `box-hotspot.service` (hostapd, config from
+  `/usr/libexec/box/hotspot-config`): `Box-Setup-XXXX`, password `boxsetup`. The
+  unit has `Conflicts=iwd.service`, so the hotspot and iwd never run together;
+  the agent leaves the hotspot by starting iwd, and calls busctl with
+  `--auto-start=no` so D-Bus activation can't start iwd behind its back.
+  networkd gives the hotspot 192.168.4.1 and DHCP (`10-setup-hotspot.network`,
   matched by `WLANInterfaceType=ap`); `captive_dns.rs` answers every name with
-  192.168.4.1 and the LAN front redirects non-`/_system` requests there.
+  192.168.4.1 and the LAN front redirects non-`/_system` requests there. Hotspot
+  start/fail messages also go to the kernel log, i.e. the Pi's screen.
 - "Connect Tailscale" (`tailscale_login.rs`) runs `tailscale up` and shows the
   sign-in link and a QR code (qrcode crate, SVG).
 - State on `/data`: `agent/` (admin password), `iwd/`, `tailscale/{state,releases,
@@ -79,7 +84,9 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   agent login and APIs, Tailscale activate/rollback, a power cut, the real
   kid-phone-server binary (fetched from GitHub on this machine) with a broken
   update rolled back, the setup hotspot and Wi-Fi joins on three
-  `mac80211_hwsim` radios (box, "home" AP, "phone"), a signed OS install into slot B through the agent, and
+  `mac80211_hwsim` radios (box; a test hostapd as the "home" AP; a test iwd as
+  the "phone", with a runtime drop-in keeping the system iwd off those two),
+  a signed OS install into slot B through the agent, and
   rollback from a broken B. Run it after anything touching boot, U-Boot, RAUC,
   the kernel, systemd units or the agent. It takes ~25 min: launch it detached
   like a build. Its docstring lists the QEMU-only adaptations (U-Boot image
@@ -153,10 +160,18 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   `Network.Connect` on the network it's already on returns success without
   trying anything, so a new password for the current network needs a
   `Station.Disconnect` first (else a typo gets saved as "joined").
-- iwd's access point mode needs a WPA2 password (no open hotspots), and the
-  Pi's brcmfmac can't scan in AP mode (mac80211 drivers, e.g. the QEMU test's
-  hwsim radios, can): the network list comes from a scan just before the
-  hotspot starts.
+- iwd's access point mode does not work with brcmfmac (START_AP fails with
+  -22: iwd runs the AP's association itself, which this FullMAC driver doesn't
+  support); hostapd does. The QEMU test's hwsim radios (mac80211) accept both,
+  so only the real Pi showed it. The chip also can't scan as an access point:
+  the network list comes from a scan just before the hotspot starts. The test
+  Zero 2 W has a BCM43430 (brcmfmac43430-sdio), like the Pi 3, not a 43436.
+- iwd deletes and recreates wlan interfaces on mac80211 drivers (hwsim) unless
+  `[DriverQuirks] DefaultInterface=*` (set in main.conf); without it wlan0 is
+  gone while iwd is stopped and hostapd has nothing to run on. brcmfmac keeps
+  its interface either way.
+- `hostapd_cli` needs `-s <dir>` (its own socket's folder; the default
+  /var/run/hostapd doesn't exist): the agent uses /run/box-hotspot for both.
 - No RTC: `/usr/lib/clock-epoch` (stamped in `post-build.sh`) keeps the clock at
   least at build time, or offline devices reject bundle signatures.
 

@@ -556,7 +556,11 @@ mod tests {
         let mut state = AppState::new("127.0.0.1:9".parse().unwrap(), dir.to_owned());
         state.reboot = Arc::new(vec!["true".into()]);
         // No iwd or Tailscale of this machine's
-        state.wifi = wifi::Wifi::new(wifi::Config { busctl: "false".into(), ..wifi::Config::device() });
+        state.wifi = wifi::Wifi::new(wifi::Config {
+            busctl: "false".into(),
+            systemctl: "false".into(),
+            ..wifi::Config::device()
+        });
         state.tailscale_login = tailscale_login::TailscaleLogin::new("false");
         state
     }

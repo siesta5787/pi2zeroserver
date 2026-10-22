@@ -242,6 +242,16 @@ fn join_line(join: &wifi::Join) -> String {
     }
 }
 
+/// Why the setup hotspot didn't start, while the box isn't on a network
+fn hotspot_error_line(w: &wifi::View) -> String {
+    match (&w.hotspot_error, &w.hotspot, &w.connected) {
+        (Some(e), None, None) => {
+            format!("<p class=\"muted\">The setup hotspot didn't start: {}</p>", esc(e))
+        }
+        _ => String::new(),
+    }
+}
+
 /// The status page's Wi-Fi summary; the setup prompt while the hotspot is on
 fn wifi_section(w: &wifi::View) -> String {
     let body = match (&w.hotspot, &w.connected) {
@@ -263,7 +273,7 @@ fn wifi_section(w: &wifi::View) -> String {
                 .to_owned()
         }
     };
-    format!("<section><h2>Wi-Fi</h2>{}{body}</section>", join_line(&w.join))
+    format!("<section><h2>Wi-Fi</h2>{}{body}{}</section>", join_line(&w.join), hotspot_error_line(w))
 }
 
 /// The Wi-Fi page: networks nearby, joining, saved networks
@@ -281,6 +291,7 @@ pub fn wifi(w: &wifi::View, error: Option<&str>) -> String {
         let _ = write!(b, "<p class=\"ok\">The box is on <b>{}</b>.</p>", esc(name));
     }
     b.push_str(&join_line(&w.join));
+    b.push_str(&hotspot_error_line(w));
 
     b.push_str("<section><h2>Networks nearby</h2>");
     if w.networks.is_empty() {
@@ -319,9 +330,14 @@ pub fn wifi(w: &wifi::View, error: Option<&str>) -> String {
             esc(&n.name)
         );
     }
+    b.push_str(if w.hotspot.is_some() {
+        "<p class=\"muted\">This list is from just before the hotspot started: the box can't look \
+         for networks while it's a hotspot. If yours is missing, type its name below.</p>"
+    } else {
+        "<form method=\"post\" action=\"/_system/wifi/scan\"><p><button>Look again</button></p></form>"
+    });
     b.push_str(
-        "<form method=\"post\" action=\"/_system/wifi/scan\"><p><button>Look again</button></p></form>\
-         <details><summary>Network not listed?</summary><form method=\"post\" action=\"/_system/wifi/join\">\
+        "<details><summary>Network not listed?</summary><form method=\"post\" action=\"/_system/wifi/join\">\
          <p><label>Network name<br><input name=\"ssid\" maxlength=\"32\" required autocapitalize=\"off\"></label></p>\
          <p><label>Password (empty if it has none)<br><input type=\"password\" name=\"password\" \
          maxlength=\"63\" autocomplete=\"off\"></label></p><p><button>Join</button></p></form></details></section>",

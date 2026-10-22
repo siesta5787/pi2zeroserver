@@ -1,0 +1,24 @@
+#!/bin/sh
+# Writes hostapd's config for the setup hotspot (box-hotspot.service).
+# Name and password: keep in sync with HOTSPOT_PREFIX and HOTSPOT_PASSWORD in
+# agent/src/wifi.rs. The address and DHCP come from 10-setup-hotspot.network.
+set -eu
+iface=wlan0
+out="$1"
+# "Box-Setup-" + the last 4 hex digits of the Wi-Fi MAC address
+tail=$(cut -d: -f5,6 "/sys/class/net/${iface}/address" | tr -d ':' | tr 'a-f' 'A-F')
+cat > "${out}" <<CONF
+interface=${iface}
+driver=nl80211
+ctrl_interface=/run/box-hotspot
+ssid=Box-Setup-${tail}
+hw_mode=g
+channel=6
+ieee80211n=1
+wmm_enabled=1
+auth_algs=1
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=boxsetup
+CONF

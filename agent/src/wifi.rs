@@ -9,12 +9,16 @@
 //! previous file back (or removes the new one).
 //!
 //! Setup hotspot: with no Wi-Fi network saved, or after a few minutes without a
-//! connection, the radio switches to access point mode as `Box-Setup-XXXX`
-//! (password [`HOTSPOT_PASSWORD`]). networkd gives it [`HOTSPOT_ADDRESS`] and runs
-//! DHCP (10-setup-hotspot.network); captive_dns answers every name with that
-//! address, so phones open the setup page by themselves. With saved networks the
-//! hotspot only stays up a few minutes at a time (longer while someone is
-//! connected) and gives way as soon as its scans see a saved network.
+//! connection, the agent starts `box-hotspot.service`: hostapd as `Box-Setup-XXXX`
+//! (password [`HOTSPOT_PASSWORD`]). iwd's own access point mode doesn't work with
+//! the Pi's brcmfmac driver, and iwd and hostapd can't share the radio, so the
+//! unit conflicts with iwd.service: starting one stops the other. That's also
+//! why the network list comes from a scan just before the hotspot starts (the
+//! chip can't scan as an access point anyway). networkd gives the hotspot
+//! [`HOTSPOT_ADDRESS`] and runs DHCP (10-setup-hotspot.network); captive_dns
+//! answers every name with that address, so phones open the setup page by
+//! themselves. With saved networks the hotspot only stays up a few minutes at a
+//! time (longer while someone is connected) before the box tries them again.
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -27,21 +31,32 @@ use serde_json::Value;
 const IWD: &str = "net.connman.iwd";
 const DEVICE: &str = "net.connman.iwd.Device";
 const STATION: &str = "net.connman.iwd.Station";
-const ACCESS_POINT: &str = "net.connman.iwd.AccessPoint";
 const NETWORK: &str = "net.connman.iwd.Network";
 const KNOWN_NETWORK: &str = "net.connman.iwd.KnownNetwork";
 
 /// The hotspot's name is this plus the end of the box's Wi-Fi address
+/// (same rule in /usr/libexec/box/hotspot-config, which writes hostapd's config)
 pub const HOTSPOT_PREFIX: &str = "Box-Setup-";
 /// Fixed and published in the setup guide: the box has no screen or label to
 /// show a per-box one. The setup pages still need the admin password.
+/// Also in /usr/libexec/box/hotspot-config.
 pub const HOTSPOT_PASSWORD: &str = "boxsetup";
+/// Runs hostapd; conflicts with iwd.service
+const HOTSPOT_UNIT: &str = "box-hotspot.service";
+const IWD_UNIT: &str = "iwd.service";
 /// The box's address on its hotspot (see 10-setup-hotspot.network)
 pub const HOTSPOT_ADDRESS: Ipv4Addr = Ipv4Addr::new(192, 168, 4, 1);
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub busctl: String,
+    pub systemctl: String,
+    pub hostapd_cli: String,
+    pub journalctl: String,
+    /// hostapd's control sockets (ctrl_interface in its config)
+    pub hotspot_ctrl: PathBuf,
+    /// Where the interface's MAC address is (`<dir>/<interface>/address`)
+    pub sysfs_net: PathBuf,
     /// iwd's network files
     pub storage: PathBuf,
     /// The Wi-Fi interface the box uses
@@ -59,6 +74,11 @@ impl Config {
     pub fn device() -> Self {
         Self {
             busctl: "busctl".into(),
+            systemctl: "systemctl".into(),
+            hostapd_cli: "hostapd_cli".into(),
+            journalctl: "journalctl".into(),
+            hotspot_ctrl: "/run/box-hotspot".into(),
+            sysfs_net: "/sys/class/net".into(),
             storage: "/data/iwd".into(),
             interface: "wlan0".into(),
             offline_grace: Duration::from_secs(180),
@@ -117,6 +137,8 @@ pub struct View {
     pub state: Option<String>,
     pub scanning: bool,
     pub hotspot: Option<Hotspot>,
+    /// Why the hotspot last failed to start
+    pub hotspot_error: Option<String>,
     pub networks: Vec<Visible>,
     pub saved: Vec<String>,
     pub join: Join,
@@ -147,7 +169,6 @@ struct DeviceObj {
     /// "station" or "ap"
     mode: String,
     station: Option<StationObj>,
-    ap: Option<ApObj>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -155,11 +176,6 @@ struct StationObj {
     state: String,
     connected_network: Option<String>,
     scanning: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct ApObj {
-    started: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -208,9 +224,6 @@ fn parse_objects(reply: &Value) -> Objects {
                     connected_network: prop_str(ifaces, STATION, "ConnectedNetwork"),
                     scanning: prop_bool(ifaces, STATION, "Scanning"),
                 }),
-                ap: ifaces
-                    .get(ACCESS_POINT)
-                    .map(|_| ApObj { started: prop_bool(ifaces, ACCESS_POINT, "Started") }),
             });
         }
         if ifaces.get(NETWORK).is_some() {
@@ -272,27 +285,6 @@ fn parse_station_networks(reply: &Value, objects: &Objects, connected: Option<&s
                 connected: connected == Some(path),
             });
         }
-    }
-    tidy(list)
-}
-
-/// `AccessPoint.GetOrderedNetworks` → visible networks
-fn parse_ap_networks(reply: &Value, saved: &[String]) -> Vec<Visible> {
-    let mut list = Vec::new();
-    for entry in reply["data"][0].as_array().into_iter().flatten() {
-        let field = |name: &str| entry.get(name).and_then(|v| v.get("data"));
-        let (Some(name), Some(kind)) =
-            (field("Name").and_then(Value::as_str), field("Type").and_then(Value::as_str))
-        else {
-            continue;
-        };
-        list.push(Visible {
-            name: name.to_owned(),
-            kind: kind.to_owned(),
-            signal: field("SignalStrength").and_then(Value::as_i64).map(|s| (s / 100) as i32).unwrap_or(-100),
-            saved: saved.iter().any(|s| s == name),
-            connected: false,
-        });
     }
     tidy(list)
 }
@@ -368,7 +360,6 @@ struct Inner {
     online_at: Instant,
     hotspot_since: Option<Instant>,
     hotspot_failed_at: Option<Instant>,
-    last_ap_scan: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -384,9 +375,17 @@ const SHORT: Duration = Duration::from_secs(10);
 const SETUP_DELAY: Duration = Duration::from_secs(10);
 /// A hotspot that didn't start is retried after this
 const HOTSPOT_RETRY: Duration = Duration::from_secs(60);
-const AP_SCAN_EVERY: Duration = Duration::from_secs(60);
 /// Lets the page that started a join from the hotspot arrive before the hotspot goes
 const LEAVE_HOTSPOT_DELAY: Duration = Duration::from_secs(3);
+
+/// Puts a line on the box's screen (kernel log), where it helps when the box
+/// can't be reached over the network
+fn tell_screen(message: &str) {
+    use std::io::Write;
+    if let Ok(mut kmsg) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        let _ = writeln!(kmsg, "<5>box: {message}");
+    }
+}
 
 impl Wifi {
     pub fn new(config: Config) -> Self {
@@ -399,7 +398,6 @@ impl Wifi {
                 online_at: now,
                 hotspot_since: None,
                 hotspot_failed_at: None,
-                last_ap_scan: None,
             })),
             op: Default::default(),
         }
@@ -419,11 +417,28 @@ impl Wifi {
         self.inner.lock().unwrap().view.hotspot.is_some()
     }
 
+    /// Runs a command; its output, or the first line of its complaint
+    async fn run(&self, program: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
+        let run = tokio::process::Command::new(program).args(args).kill_on_drop(true).output();
+        let out = tokio::time::timeout(timeout, run)
+            .await
+            .map_err(|_| format!("{program} didn't finish"))?
+            .map_err(|e| format!("{program}: {e}"))?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed").to_owned())
+    }
+
     async fn busctl(&self, args: &[&str], timeout: Duration) -> Result<Value, String> {
         let mut cmd = tokio::process::Command::new(&self.config.busctl);
-        // "--" so SSIDs starting with "-" aren't read as options
-        cmd.arg("--json=short").arg(format!("--timeout={}", timeout.as_secs())).arg("--").args(args);
-        let run = cmd.kill_on_drop(true).output();
+        // Never start iwd by asking it something (D-Bus activation): that would
+        // stop the hotspot. "--" so SSIDs starting with "-" aren't read as options.
+        cmd.args(["--json=short", "--auto-start=no"])
+            .arg(format!("--timeout={}", timeout.as_secs()))
+            .arg("--");
+        let run = cmd.args(args).kill_on_drop(true).output();
         let out = tokio::time::timeout(timeout + Duration::from_secs(5), run)
             .await
             .map_err(|_| "iwd didn't answer".to_owned())?
@@ -456,10 +471,6 @@ impl Wifi {
         let reply =
             self.call("/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", &[], SHORT).await?;
         Ok(parse_objects(&reply))
-    }
-
-    async fn set_mode(&self, device: &str, mode: &str) -> Result<(), String> {
-        self.busctl(&["set-property", IWD, device, DEVICE, "Mode", "s", mode], SHORT).await.map(drop)
     }
 
     /// Waits until `ready` holds for our device, for up to `limit`
@@ -497,61 +508,98 @@ impl Wifi {
         self.wait_for(Duration::from_secs(15), |_, d| d.station.as_ref().is_some_and(|s| !s.scanning)).await
     }
 
-    /// Switches to the hotspot; remembers what's around first, since the AP may not be able to scan
+    async fn hotspot_running(&self) -> bool {
+        self.run(&self.config.systemctl, &["is-active", "--quiet", HOTSPOT_UNIT], SHORT).await.is_ok()
+    }
+
+    fn hotspot_ssid(&self) -> String {
+        let path = self.config.sysfs_net.join(&self.config.interface).join("address");
+        hotspot_ssid(std::fs::read_to_string(path).unwrap_or_default().trim())
+    }
+
+    /// hostapd's `hostapd_cli` for our interface
+    async fn hostapd_cli(&self, command: &str) -> Result<String, String> {
+        let ctrl = self.config.hotspot_ctrl.to_string_lossy();
+        // Its own socket goes there too: the default folder doesn't exist
+        let args = ["-s", &ctrl, "-p", &ctrl, "-i", &self.config.interface, command];
+        self.run(&self.config.hostapd_cli, &args, SHORT).await
+    }
+
+    /// Starts hostapd (which stops iwd) and waits until it says the hotspot is up
+    async fn run_hostapd(&self) -> Result<(), String> {
+        self.run(&self.config.systemctl, &["start", HOTSPOT_UNIT], Duration::from_secs(30)).await?;
+        for _ in 0..40 {
+            if self.hostapd_cli("status").await.is_ok_and(|s| s.lines().any(|l| l == "state=ENABLED")) {
+                return Ok(());
+            }
+            if !self.hotspot_running().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        // hostapd's own last words say why (not systemd's "failed with result ...")
+        let unit = format!("_SYSTEMD_UNIT={HOTSPOT_UNIT}");
+        let log = self
+            .run(&self.config.journalctl, &[&unit, "-b", "-n", "2", "-o", "cat", "--no-pager"], SHORT)
+            .await
+            .unwrap_or_default();
+        let log: Vec<&str> = log.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        Err(if log.is_empty() { "hostapd didn't start".to_owned() } else { log.join(" / ") })
+    }
+
+    /// Switches to the hotspot; remembers what's around first, since it can't scan then
     async fn start_hotspot(&self, device: &DeviceObj, setup: bool) {
-        if device.mode == "station"
-            && let Some(objects) = self.scan_and_wait(&device.path).await
+        if let Some(objects) = self.scan_and_wait(&device.path).await
             && let Some(dev) = objects.device(&self.config.interface)
         {
             let networks = self.station_networks(dev, &objects).await;
             self.inner.lock().unwrap().view.networks = networks;
         }
-        let ssid = hotspot_ssid(&device.address);
-        let result = async {
-            if device.mode != "ap" {
-                self.set_mode(&device.path, "ap").await?;
-                self.wait_for(Duration::from_secs(10), |_, d| d.ap.is_some())
-                    .await
-                    .ok_or("no access point mode")?;
-            }
-            self.call(&device.path, ACCESS_POINT, "Start", &["ss", &ssid, HOTSPOT_PASSWORD], SHORT).await
-        }
-        .await;
-        match result {
-            Ok(_) => {
+        let ssid = self.hotspot_ssid();
+        match self.run_hostapd().await {
+            Ok(()) => {
                 eprintln!("wifi: setup hotspot {ssid} started");
+                tell_screen(&format!("setup hotspot {ssid} is on (password {HOTSPOT_PASSWORD})"));
                 let mut inner = self.inner.lock().unwrap();
                 inner.hotspot_since = Some(Instant::now());
-                inner.last_ap_scan = None;
                 inner.view.hotspot = Some(Hotspot { ssid, password: HOTSPOT_PASSWORD.into(), setup });
+                inner.view.hotspot_error = None;
                 inner.view.connected = None;
             }
             Err(e) => {
                 eprintln!("wifi: setup hotspot didn't start: {e}");
-                self.inner.lock().unwrap().hotspot_failed_at = Some(Instant::now());
-                let _ = self.set_mode(&device.path, "station").await;
+                tell_screen(&format!("setup hotspot didn't start: {e}"));
+                {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.hotspot_failed_at = Some(Instant::now());
+                    inner.view.hotspot_error = Some(e);
+                }
+                self.back_to_iwd().await;
             }
         }
     }
 
-    async fn stop_hotspot(&self, device: &str) {
-        let _ = self.call(device, ACCESS_POINT, "Stop", &[], SHORT).await;
-        if let Err(e) = self.set_mode(device, "station").await {
-            eprintln!("wifi: back to station mode: {e}");
+    /// Ends the hotspot (starting iwd stops it) and waits for iwd's station
+    async fn back_to_iwd(&self) -> Option<Objects> {
+        if let Err(e) = self.run(&self.config.systemctl, &["start", IWD_UNIT], Duration::from_secs(30)).await
+        {
+            eprintln!("wifi: starting iwd: {e}");
         }
-        let mut inner = self.inner.lock().unwrap();
-        if inner.view.hotspot.take().is_some() {
-            eprintln!("wifi: setup hotspot stopped");
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.view.hotspot.take().is_some() {
+                eprintln!("wifi: setup hotspot stopped");
+            }
+            inner.hotspot_since = None;
+            inner.online_at = Instant::now();
         }
-        inner.hotspot_since = None;
-        inner.online_at = Instant::now();
+        self.wait_for(Duration::from_secs(20), |_, d| d.station.is_some()).await
     }
 
     /// Number of devices connected to the hotspot
-    async fn hotspot_clients(&self, device: &str) -> usize {
-        let reply =
-            self.call(device, "net.connman.iwd.AccessPointDiagnostic", "GetDiagnostics", &[], SHORT).await;
-        reply.ok().and_then(|r| r["data"][0].as_array().map(Vec::len)).unwrap_or(0)
+    async fn hotspot_clients(&self) -> usize {
+        let list = self.hostapd_cli("list_sta").await.unwrap_or_default();
+        list.lines().filter(|l| l.trim().len() == 17 && l.matches(':').count() == 5).count()
     }
 
     fn set_unavailable(&self) {
@@ -564,6 +612,9 @@ impl Wifi {
     /// One look at the Wi-Fi, deciding whether the hotspot should come or go
     async fn tick(&self) {
         let _op = self.op.lock().await;
+        if self.hotspot_running().await {
+            return self.hotspot_tick().await;
+        }
         let Ok(objects) = self.objects().await else {
             return self.set_unavailable();
         };
@@ -576,97 +627,79 @@ impl Wifi {
                 .await;
             return;
         }
+        let Some(station) = device.station.as_ref().filter(|_| device.mode == "station") else {
+            // Not the box's doing; it only uses station mode with iwd
+            let _ = self
+                .busctl(&["set-property", IWD, &device.path, DEVICE, "Mode", "s", "station"], SHORT)
+                .await;
+            return;
+        };
         let saved = objects.saved();
         let now = Instant::now();
-        match (device.mode.as_str(), &device.station, &device.ap) {
-            ("station", Some(station), _) => {
-                let connected = station
-                    .connected_network
-                    .as_deref()
-                    .and_then(|p| objects.network(p))
-                    .map(|n| n.name.clone());
-                let networks = self.station_networks(&device, &objects).await;
-                let start = {
-                    let mut inner = self.inner.lock().unwrap();
-                    let v = &mut inner.view;
-                    v.available = true;
-                    v.state = Some(station.state.clone());
-                    v.scanning = station.scanning;
-                    v.connected = connected.clone();
-                    v.saved = saved.clone();
-                    v.hotspot = None;
-                    if !networks.is_empty() {
-                        v.networks = networks;
-                    }
-                    if connected.is_some() || station.state == "connecting" {
-                        inner.online_at = now;
-                    }
-                    inner.hotspot_since = None;
-                    let retry_ok = inner.hotspot_failed_at.is_none_or(|t| now - t >= HOTSPOT_RETRY);
-                    let due = if saved.is_empty() {
-                        now - inner.started >= SETUP_DELAY
-                    } else {
-                        now - inner.online_at >= self.config.offline_grace
-                    };
-                    connected.is_none() && retry_ok && due
-                };
-                if start {
-                    self.start_hotspot(&device, saved.is_empty()).await;
-                }
+        let connected =
+            station.connected_network.as_deref().and_then(|p| objects.network(p)).map(|n| n.name.clone());
+        let networks = self.station_networks(&device, &objects).await;
+        let start = {
+            let mut inner = self.inner.lock().unwrap();
+            let v = &mut inner.view;
+            v.available = true;
+            v.state = Some(station.state.clone());
+            v.scanning = station.scanning;
+            v.connected = connected.clone();
+            v.saved = saved.clone();
+            v.hotspot = None;
+            if !networks.is_empty() {
+                v.networks = networks;
             }
-            ("ap", _, Some(ap)) => {
-                if !ap.started {
-                    // Not ours, or iwd restarted it: (re)start it as the hotspot
-                    return self.start_hotspot(&device, saved.is_empty()).await;
-                }
-                let (since, scan_due) = {
-                    let mut inner = self.inner.lock().unwrap();
-                    inner.view.available = true;
-                    inner.view.state = Some("hotspot".into());
-                    inner.view.saved = saved.clone();
-                    inner.view.connected = None;
-                    if inner.view.hotspot.is_none() {
-                        // The agent restarted while the hotspot was on
-                        let ssid = hotspot_ssid(&device.address);
-                        inner.view.hotspot = Some(Hotspot {
-                            ssid,
-                            password: HOTSPOT_PASSWORD.into(),
-                            setup: saved.is_empty(),
-                        });
-                    }
-                    if let Some(h) = inner.view.hotspot.as_mut() {
-                        h.setup = saved.is_empty();
-                    }
-                    let since = *inner.hotspot_since.get_or_insert(now);
-                    (since, inner.last_ap_scan.is_none_or(|t| now - t >= AP_SCAN_EVERY))
-                };
-                if let Ok(reply) =
-                    self.call(&device.path, ACCESS_POINT, "GetOrderedNetworks", &[], SHORT).await
-                {
-                    let networks = parse_ap_networks(&reply, &saved);
-                    if !networks.is_empty() {
-                        self.inner.lock().unwrap().view.networks = networks;
-                    }
-                }
-                if saved.is_empty() || self.join_busy() {
-                    return;
-                }
-                // Fallback hotspot: scan now and then, leave when a saved network is back or time's up
-                if scan_due {
-                    self.inner.lock().unwrap().last_ap_scan = Some(now);
-                    let _ = self.call(&device.path, ACCESS_POINT, "Scan", &[], SHORT).await;
-                }
-                let saved_nearby = self.view().networks.iter().any(|n| n.saved);
-                let window = if self.hotspot_clients(&device.path).await > 0 {
-                    self.config.hotspot_window_busy
-                } else {
-                    self.config.hotspot_window
-                };
-                if saved_nearby || now - since >= window {
-                    self.stop_hotspot(&device.path).await;
-                }
+            if connected.is_some() || station.state == "connecting" {
+                inner.online_at = now;
             }
-            _ => self.set_unavailable(),
+            inner.hotspot_since = None;
+            let retry_ok = inner.hotspot_failed_at.is_none_or(|t| now - t >= HOTSPOT_RETRY);
+            let due = if saved.is_empty() {
+                now - inner.started >= SETUP_DELAY
+            } else {
+                now - inner.online_at >= self.config.offline_grace
+            };
+            connected.is_none() && retry_ok && due
+        };
+        if start {
+            self.start_hotspot(&device, saved.is_empty()).await;
+        }
+    }
+
+    /// While the hotspot is on (iwd is stopped): leave it after a while if there
+    /// are saved networks to try again
+    async fn hotspot_tick(&self) {
+        let now = Instant::now();
+        let (since, setup) = {
+            let mut inner = self.inner.lock().unwrap();
+            let setup = inner.view.saved.is_empty();
+            if inner.view.hotspot.is_none() {
+                // The agent restarted while the hotspot was on
+                let ssid = self.hotspot_ssid();
+                inner.view.hotspot = Some(Hotspot { ssid, password: HOTSPOT_PASSWORD.into(), setup });
+            }
+            if let Some(h) = inner.view.hotspot.as_mut() {
+                h.setup = setup;
+            }
+            let v = &mut inner.view;
+            v.available = true;
+            v.state = Some("hotspot".into());
+            v.scanning = false;
+            v.connected = None;
+            (*inner.hotspot_since.get_or_insert(now), setup)
+        };
+        if setup || self.join_busy() {
+            return;
+        }
+        let window = if self.hotspot_clients().await > 0 {
+            self.config.hotspot_window_busy
+        } else {
+            self.config.hotspot_window
+        };
+        if now - since >= window {
+            self.back_to_iwd().await;
         }
     }
 
@@ -684,15 +717,18 @@ impl Wifi {
         matches!(self.inner.lock().unwrap().view.join, Join::Joining { .. })
     }
 
-    /// Asks for a fresh list of networks (shown on the next look, a few seconds later)
+    /// Asks for a fresh list of networks (shown on the next look, a few seconds
+    /// later). Not while the hotspot is on: the chip can't scan then.
     pub fn scan(&self) {
         let wifi = self.clone();
         tokio::spawn(async move {
             let _op = wifi.op.lock().await;
+            if wifi.hotspot_running().await {
+                return;
+            }
             let Ok(objects) = wifi.objects().await else { return };
             if let Some(device) = objects.device(&wifi.config.interface) {
-                let iface = if device.mode == "ap" { ACCESS_POINT } else { STATION };
-                let _ = wifi.call(&device.path, iface, "Scan", &[], SHORT).await;
+                let _ = wifi.call(&device.path, STATION, "Scan", &[], SHORT).await;
             }
         });
     }
@@ -741,18 +777,15 @@ impl Wifi {
     }
 
     async fn connect(&self, ssid: &str, passphrase: &str) -> Result<(), String> {
+        if self.hotspot_running().await {
+            self.back_to_iwd().await.ok_or("The Wi-Fi didn't come back from the hotspot.")?;
+        }
         let objects = self.objects().await?;
         let device = objects.device(&self.config.interface).ok_or("The box has no Wi-Fi device.")?.clone();
         // Where to go back to if this doesn't work out
         let previous = device.station.as_ref().and_then(|s| s.connected_network.clone());
-        if device.mode != "station" {
-            self.stop_hotspot(&device.path).await;
-            self.wait_for(Duration::from_secs(10), |_, d| d.station.is_some())
-                .await
-                .ok_or("The Wi-Fi didn't switch back from the hotspot.")?;
-        }
-        let objects = match self.objects().await?.find_network(&device.path, ssid) {
-            Some(_) => self.objects().await?,
+        let objects = match objects.find_network(&device.path, ssid) {
+            Some(_) => objects,
             None => self.scan_and_wait(&device.path).await.unwrap_or_default(),
         };
         let net = objects
@@ -823,13 +856,28 @@ impl Wifi {
     /// Forgets a saved network (disconnecting if it's the current one)
     pub async fn forget(&self, name: &str) -> Result<(), String> {
         let _op = self.op.lock().await;
-        let objects = self.objects().await?;
-        let known: Vec<&KnownObj> = objects.known.iter().filter(|k| k.name == name).collect();
-        if known.is_empty() {
-            return Err(format!("\"{name}\" isn't saved."));
-        }
-        for k in known {
-            self.call(&k.path, KNOWN_NETWORK, "Forget", &[], SHORT).await?;
+        if self.hotspot_running().await {
+            // iwd is stopped: remove its files (it reads the folder when it starts)
+            let files: Vec<PathBuf> = ["psk", "open", "8021x"]
+                .iter()
+                .map(|kind| network_file(&self.config.storage, name, kind))
+                .filter(|f| f.exists())
+                .collect();
+            if files.is_empty() {
+                return Err(format!("\"{name}\" isn't saved."));
+            }
+            for f in files {
+                std::fs::remove_file(&f).map_err(|e| format!("Couldn't forget \"{name}\": {e}"))?;
+            }
+        } else {
+            let objects = self.objects().await?;
+            let known: Vec<&KnownObj> = objects.known.iter().filter(|k| k.name == name).collect();
+            if known.is_empty() {
+                return Err(format!("\"{name}\" isn't saved."));
+            }
+            for k in known {
+                self.call(&k.path, KNOWN_NETWORK, "Forget", &[], SHORT).await?;
+            }
         }
         eprintln!("wifi: forgot {name:?}");
         let mut inner = self.inner.lock().unwrap();
@@ -914,7 +962,6 @@ mod tests {
         let station = dev.station.as_ref().unwrap();
         assert_eq!(station.state, "connected");
         assert_eq!(o.network(station.connected_network.as_deref().unwrap()).unwrap().name, "Home");
-        assert!(dev.ap.is_none());
         assert_eq!(o.find_network(&dev.path, "Café").unwrap().kind, "open");
         assert!(o.find_network(&dev.path, "Home").unwrap().known);
         // Setup hotspots (another box's, or the test's) don't count as saved
@@ -939,24 +986,6 @@ mod tests {
             Visible { name: "Home".into(), kind: "psk".into(), signal: -45, saved: true, connected: true }
         );
         assert_eq!((list[1].name.as_str(), list[1].signal, list[1].connected), ("Café", -72, false));
-    }
-
-    #[test]
-    fn lists_networks_seen_by_the_hotspot() {
-        let entry = |name: &str, signal: i64, kind: &str| {
-            serde_json::json!({"Name": {"type": "s", "data": name},
-                "SignalStrength": {"type": "n", "data": signal}, "Type": {"type": "s", "data": kind}})
-        };
-        let reply = serde_json::json!({"type": "aa{sv}", "data": [[
-            entry("Home", -6000, "psk"), entry("Home", -5000, "psk"), entry("Box-Setup-9999", -2000, "psk"),
-            entry("Office", -8000, "8021x")
-        ]]});
-        let list = parse_ap_networks(&reply, &["Home".to_owned()]);
-        assert_eq!(
-            list.iter().map(|n| (n.name.as_str(), n.signal)).collect::<Vec<_>>(),
-            [("Home", -50), ("Office", -80)]
-        );
-        assert!(list[0].saved && !list[1].saved);
     }
 
     #[test]
@@ -1004,14 +1033,16 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_bad_join_requests() {
-        let wifi = Wifi::new(Config { busctl: "false".into(), ..Config::device() });
+        let wifi =
+            Wifi::new(Config { busctl: "false".into(), systemctl: "false".into(), ..Config::device() });
         assert_eq!(wifi.join(String::new(), String::new()), Err(JoinError::BadName));
         assert_eq!(wifi.join("Home".into(), "short".into()), Err(JoinError::BadPassword));
     }
 
     #[tokio::test]
     async fn no_iwd_means_no_wifi() {
-        let wifi = Wifi::new(Config { busctl: "false".into(), ..Config::device() });
+        let wifi =
+            Wifi::new(Config { busctl: "false".into(), systemctl: "false".into(), ..Config::device() });
         wifi.tick().await;
         let view = wifi.view();
         assert!(!view.available && view.hotspot.is_none());

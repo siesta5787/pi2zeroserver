@@ -1,0 +1,12 @@
+[Unit]
+Description=Setup hotspot (started by box-agent while the box has no Wi-Fi)
+# hostapd and iwd can't share the radio: starting either stops the other.
+# box-agent ends the hotspot by starting iwd.
+Conflicts=iwd.service
+After=iwd.service sys-subsystem-net-devices-wlan0.device
+
+[Service]
+RuntimeDirectory=box-hotspot
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/libexec/box/hotspot-config /run/box-hotspot/hostapd.conf
+ExecStart=/usr/sbin/hostapd /run/box-hotspot/hostapd.conf
