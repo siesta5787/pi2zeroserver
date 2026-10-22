@@ -498,7 +498,14 @@ pub fn status(s: &Status, updates: &Updates) -> String {
 
     b.push_str(
         "<p class=\"muted\"><a href=\"/_system/password\">Change password</a></p>\
-         <form method=\"post\" action=\"/_system/logout\"><button>Sign out</button></form>",
+         <form method=\"post\" action=\"/_system/logout\"><button>Sign out</button></form>\
+         <details><summary class=\"muted\">Erase everything</summary>\
+         <p>Erases the box's Wi-Fi settings, its Tailscale connection, the app with all its data, \
+         and this password. The system itself stays. Afterwards the box starts its setup hotspot, \
+         like a new one.</p><form method=\"post\" action=\"/_system/factory-reset\">\
+         <p><label><input type=\"checkbox\" name=\"confirm\" value=\"yes\" required> \
+         I understand that everything on the box will be erased</label></p>\
+         <p><button>Erase and restart</button></p></form></details>",
     );
     let busy = matches!(updates.install, Install::Running { .. })
         || updates.manifest.checking
@@ -516,6 +523,17 @@ pub fn status(s: &Status, updates: &Updates) -> String {
 
 pub fn message(title: &str, text: &str) -> String {
     page(title, &format!("<h1>{}</h1><p>{}</p><p><a href=\"/_system/\">Back</a></p>", esc(title), esc(text)))
+}
+
+pub fn erasing() -> String {
+    page(
+        "Erasing",
+        "<h1>Erasing…</h1><p>The box is signing out of Tailscale, restarting and erasing its \
+         settings and the app's data. In a couple of minutes it comes back with its setup hotspot \
+         (<b>Box-Setup-…</b>, password <b>boxsetup</b>), like a new box.</p>\
+         <p class=\"muted\">If the box still shows up in your Tailscale admin console, you can \
+         remove it there.</p>",
+    )
 }
 
 pub fn restarting() -> String {
@@ -539,7 +557,14 @@ pub fn login(error: Option<&str>) -> String {
              <form method=\"post\" action=\"/_system/login\">\
              <p><label>Password<br><input type=\"password\" name=\"password\" \
              autocomplete=\"current-password\" required autofocus></label></p>\
-             <p><button>Sign in</button></p></form>",
+             <p><button>Sign in</button></p></form>\
+             <details><summary class=\"muted\">Forgot the password?</summary>\
+             <p>Turn the box off and put its SD card in a computer. On the card's small \
+             partition named <b>BOOT</b>, create an empty file called <b>reset-password.txt</b>. \
+             Put the card back and turn the box on: it asks you to choose a new password. \
+             Wi-Fi, Tailscale and the app are kept.</p>\
+             <p class=\"muted\">A file called <b>factory-reset.txt</b> instead erases \
+             everything, like a new box.</p></details>",
             error_line(error)
         ),
     )

@@ -7,6 +7,7 @@ Boots a copy of the dev sdcard.img and checks:
   2. after the power cut /data is intact; `rauc install` of a signed bundle
      switches to slot B, which boots, is marked good and sees the same /data
   3. a broken slot B (kernel removed) uses up its tries and rolls back to slot A
+  4. "Erase everything" on the box's page wipes the owner's data and restarts
 Along the way: the built-in Tailscale runs, a newer release activates from
 /data (and survives the OS update), and a broken release rolls back; the real
 app runs and a broken app update rolls back; and on virtual Wi-Fi radios
@@ -188,6 +189,26 @@ def inject_bundle(card, bundle):
         dst.seek(start)
         shutil.copyfileobj(src, dst)
     os.remove(part)
+
+
+def request_on_boot_partition(card, name):
+    """Put an (empty) recovery request file on the boot partition, like the
+    owner would from a computer, while QEMU is off."""
+    start, _ = partitions(card)[0]
+    empty = os.path.join(WORK, "empty.txt")
+    open(empty, "w").close()
+    run(os.path.join(HOST, "bin", "mcopy"), "-o", "-i", f"{card}@@{start}", empty, f"::{name}")
+
+
+def boot_partition_files(con):
+    return con.sh("mkdir -p /run/t && mount -t vfat -o ro /dev/mmcblk0p1 /run/t && ls /run/t; umount /run/t",
+                  check=False)[1]
+
+
+def first_page(con):
+    """Where /_system/ sends a browser without a session"""
+    out = con.sh("curl -s -m 10 -o /dev/null -w '%{redirect_url}\\n' http://127.0.0.1/_system/", check=False)[1]
+    return out.splitlines()[-1] if out else ""
 
 
 class Console:
@@ -644,13 +665,23 @@ def main():
         con.stop()  # pull the power
 
     # 2. After the power cut: /data intact; update into slot B
-    step("power cut done; copying the update bundle onto /data offline")
+    step("power cut done; copying the update bundle onto /data offline, asking for a password reset")
     inject_bundle(card, bundle)
+    # Mixed case on purpose: people (and Windows) won't type it exactly
+    request_on_boot_partition(card, "Reset-Password.txt")
     con = Console(card, uboot, dtb)
     try:
         con.expect(r"Booting slot A", 300)
         con.login()
         check("/data intact after power cut", con.sh("cat /data/marker")[1].splitlines()[-1] == "kept")
+        check("reset-password.txt on the boot partition: the box asks for a new password",
+              first_page(con).endswith("/_system/password"), first_page(con))
+        files = boot_partition_files(con)
+        check("the request file is removed once done", "reset-password" not in files.lower(), files)
+        rc, _ = con.sh("test -e /data/iwd/TestHome.psk", check=False)
+        check("a password reset keeps the Wi-Fi", rc == 0)
+        cookie = agent_post(con, "/_system/password", f"password={ADMIN_PASSWORD}&confirm={ADMIN_PASSWORD}")
+        check("a new admin password can be set", bool(cookie))
         check_app(con)
         version_a = con.sh("cat /etc/box-version")[1].splitlines()[-1]
 
@@ -685,6 +716,31 @@ def main():
         con.login()
         check("broken slot B rolls back to slot A", booted_slot(con) == "A")
         check("slot B has no tries left", env(con, "BOOT_B_LEFT") == "0")
+
+        # 4. Erase everything, from the box's page
+        cookie = agent_post(con, "/_system/login", f"password={ADMIN_PASSWORD}")
+        code, body = agent_api(con, "/_system/factory-reset", cookie, "confirm=yes")
+        check("Erase everything starts", code == 200 and "Erasing" in body, f"{code} {body[-200:]}")
+        con.expect(r"Booting slot A", 600)
+        con.login()
+        rc, out = con.sh("test ! -e /data/agent/admin-password && test ! -e /data/iwd/TestHome.psk "
+                         "&& test ! -e /data/app/current && test ! -e /data/app/env "
+                         "&& test -z \"$(ls -A /data/tailscale/releases)\" && test ! -e /data/.factory-reset; echo $?",
+                         check=False)
+        check("erased: password, Wi-Fi, app and its data, Tailscale", out.splitlines()[-1:] == ["0"], out)
+        rc, out = con.sh("test -d /data/app/state && test -d /data/iwd && cat /data/marker", check=False)
+        check("folders recreated, other /data kept", out.splitlines()[-1:] == ["kept"], out)
+        # tailscaled starts afresh with a new (signed-out) state
+        state = con.sh("for i in $(seq 30); do s=$(tailscale status --json 2>/dev/null | sed -n "
+                       "'s/.*\"BackendState\": *\"\\([A-Za-z]*\\)\".*/\\1/p'); [ -n \"$s\" ] && break; sleep 2; done; "
+                       "echo $s", timeout=120, check=False)[1]
+        check("erased Tailscale waits for a new sign-in", state.splitlines()[-1:] == ["NeedsLogin"], state)
+        check("an erased box asks for a new password", first_page(con).endswith("/_system/password"),
+              first_page(con))
+        check("an erased box still runs its built-in Tailscale",
+              "/usr/lib/box/tailscale/" in tailscaled_exe(con), tailscaled_exe(con))
+        rc, failed = con.sh("systemctl --failed --no-legend --plain --no-pager", check=False)
+        check("no failed units after erasing", not failed.strip(), failed.strip())
         print("All A/B checks passed.")
     finally:
         con.stop()

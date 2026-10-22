@@ -1,0 +1,69 @@
+#!/bin/sh
+# Recovery requests, acted on early at boot (box-recovery.service), before
+# anything uses /data. The owner asks by putting a file on the SD card's boot
+# partition (any computer can write it); the agent's "Erase everything" button
+# leaves /data/.factory-reset.
+#
+#   reset-password*   forget the admin password (choose a new one on the box's page)
+#   factory-reset*    erase Wi-Fi, Tailscale, the app and its data, and the password
+#
+# Names are matched loosely (any case; Windows may add a hidden ".txt"). A
+# request is removed only after it's done, so a power cut means it runs again.
+set -u
+boot=/dev/mmcblk0p1
+mnt=/run/box-recovery
+say() {
+	echo "$*"
+	echo "<5>box: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+reset_password=
+factory_reset=
+[ -e /data/.factory-reset ] && factory_reset=1
+
+# What a file on the boot partition asks for, if anything
+request() {
+	case "$(basename "$1" | tr 'A-Z' 'a-z')" in
+	._*) ;; # macOS metadata
+	reset-password*) echo reset_password ;;
+	factory-reset*) echo factory_reset ;;
+	esac
+}
+
+mkdir -p "${mnt}"
+# Read-only unless there's something to delete: the firmware boots from here
+found=
+if mount -t vfat -o ro,nodev,nosuid,noexec "${boot}" "${mnt}" 2>/dev/null; then
+	for f in "${mnt}"/*; do
+		[ -f "${f}" ] || continue
+		case "$(request "${f}")" in
+		reset_password) reset_password=1 found=1 ;;
+		factory_reset) factory_reset=1 found=1 ;;
+		esac
+	done
+fi
+
+if [ -n "${factory_reset}" ]; then
+	say "factory reset: erasing Wi-Fi, Tailscale, the app and its data, and the admin password"
+	rm -rf /data/agent /data/iwd /data/tailscale /data/app
+	sync
+	say "factory reset done: the setup hotspot comes up shortly"
+elif [ -n "${reset_password}" ]; then
+	rm -f /data/agent/admin-password
+	sync
+	say "admin password reset: open the box's page to choose a new one"
+fi
+
+rm -f /data/.factory-reset
+if [ -n "${found}" ] && mount -o remount,rw "${mnt}"; then
+	for f in "${mnt}"/*; do
+		[ -f "${f}" ] || continue
+		if [ -n "$(request "${f}")" ]; then
+			rm -f "${f}" "$(dirname "${f}")/._$(basename "${f}")"
+		fi
+	done
+	sync
+fi
+mountpoint -q "${mnt}" && umount "${mnt}"
+rmdir "${mnt}" 2>/dev/null
+exit 0

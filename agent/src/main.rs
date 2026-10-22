@@ -50,6 +50,8 @@ struct AppState {
     wifi: wifi::Wifi,
     /// Command that restarts the box (replaced in tests)
     reboot: Arc<Vec<String>>,
+    /// Asks box-recovery.service to erase the box at the next start
+    factory_reset_flag: Arc<PathBuf>,
 }
 
 impl AppState {
@@ -69,6 +71,7 @@ impl AppState {
             tailscale_login: tailscale_login::TailscaleLogin::new("tailscale"),
             wifi: wifi::Wifi::new(wifi::Config::device()),
             reboot: Arc::new(vec!["systemctl".into(), "reboot".into()]),
+            factory_reset_flag: Arc::new("/data/.factory-reset".into()),
         }
     }
 }
@@ -130,6 +133,7 @@ fn router(state: AppState, front: Front) -> Router {
         .route("/_system/api/os/install", get(os_install_state).post(os_install_api))
         .route("/_system/os/install", post(os_install_form))
         .route("/_system/restart", post(restart))
+        .route("/_system/factory-reset", post(factory_reset))
         .route("/_system/check", post(check_form))
         .route("/_system/os/update", post(os_update_form))
         .route("/_system/api/updates", get(updates_state))
@@ -436,6 +440,33 @@ async fn restart(State(state): State<AppState>) -> impl IntoResponse {
     Html(pages::restarting())
 }
 
+#[derive(Deserialize)]
+struct FactoryResetForm {
+    #[serde(default)]
+    confirm: String,
+}
+
+/// Erases the box: box-recovery.service does the erasing at the next start,
+/// after the box has signed out of Tailscale
+async fn factory_reset(State(state): State<AppState>, Form(form): Form<FactoryResetForm>) -> Response {
+    if form.confirm != "yes" {
+        let page = pages::message("Nothing erased", "Tick the box to confirm, then try again.");
+        return (StatusCode::BAD_REQUEST, Html(page)).into_response();
+    }
+    if let Err(e) = std::fs::write(state.factory_reset_flag.as_path(), b"requested from the box's page\n") {
+        eprintln!("factory reset: {e}");
+        let page = pages::message("Nothing erased", "The box couldn't start erasing. Try again.");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Html(page)).into_response();
+    }
+    eprintln!("factory reset requested; signing out of Tailscale and restarting");
+    let s = state.clone();
+    tokio::spawn(async move {
+        s.tailscale_login.logout().await;
+        schedule_restart(&s);
+    });
+    Html(pages::erasing()).into_response()
+}
+
 /// Response that logs the browser in and continues to the status page
 fn signed_in(token: &str) -> Response {
     ([(header::SET_COOKIE, auth::session_cookie(token))], Redirect::to("/_system/")).into_response()
@@ -603,6 +634,7 @@ mod tests {
             ..wifi::Config::device()
         });
         state.tailscale_login = tailscale_login::TailscaleLogin::new("false");
+        state.factory_reset_flag = Arc::new(dir.join(".factory-reset"));
         state
     }
 
@@ -806,6 +838,23 @@ mod tests {
         let r = submit(&agent, "/_system/restart", Some(&cookie), "").await;
         assert_eq!(r.status, StatusCode::OK);
         assert!(r.body.contains("Restarting"));
+    }
+
+    #[tokio::test]
+    async fn factory_reset_needs_confirmation() {
+        let agent = start_agent(unused_port().await).await;
+        let cookie = set_up(&agent).await;
+        let flag = agent._data.path().join(".factory-reset");
+        let r = submit(&agent, "/_system/factory-reset", None, "confirm=yes").await;
+        assert_eq!(r.location(), "/_system/login", "needs the password");
+        assert_eq!(
+            submit(&agent, "/_system/factory-reset", Some(&cookie), "").await.status,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!flag.exists());
+        let r = submit(&agent, "/_system/factory-reset", Some(&cookie), "confirm=yes").await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert!(r.body.contains("Erasing") && flag.exists(), "{}", r.body);
     }
 
     #[tokio::test]

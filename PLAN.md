@@ -109,8 +109,13 @@ explicit choice.
 Offline for 3 min with saved networks → the hotspot comes up for 5 min (15 while
 someone is connected), then the box tries its networks again; it leaves early
 when a scan sees a saved network.
-Still to do: factory reset / forgotten admin password (a file on the boot
-partition, read at boot).
+Recovery (box-recovery.service, early at boot, before anything uses /data): an
+empty `reset-password.txt` on the card's BOOT partition (FAT, readable on any
+computer) forgets the admin password; `factory-reset.txt` erases Wi-Fi,
+Tailscale, the app and its data, and the password (the OS and its backup slot
+stay). Names match loosely (case, hidden `.txt`). The page's "Erase everything"
+button signs out of Tailscale and leaves `/data/.factory-reset` for the same
+service. The sign-in page explains the password reset.
 
 ## Security
 
@@ -258,7 +263,9 @@ RPi Server DIstro/          (this folder, git)
      three mac80211_hwsim radios (box, home AP, phone).
      Still to verify on the Pi: hostapd hotspot, phones' captive portal
      prompts, the Tailscale sign-in with internet.
-   - 6b: factory reset and forgotten-password recovery; box name.
+   - ✅ 6b: forgotten password and factory reset via a file on the boot
+     partition, and an "Erase everything" button; QEMU test covers both.
+     Later: a box name (several boxes on one network would all be box.local).
 7. Hardening: firewall, sandboxing, release defconfig (no curl CLI, no HDMI
    console login, release signing key).
 8. Releases: CI pipeline, signed manifest, Imager repo, novice guide.

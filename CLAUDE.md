@@ -30,6 +30,13 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   matched by `WLANInterfaceType=ap`); `captive_dns.rs` answers every name with
   192.168.4.1 and the LAN front redirects non-`/_system` requests there. Hotspot
   start/fail messages also go to the kernel log, i.e. the Pi's screen.
+- Recovery: `box-recovery.service` (`/usr/libexec/box/recovery`) runs before
+  anything uses /data. `reset-password*` / `factory-reset*` files on the boot
+  partition (`/dev/mmcblk0p1`, FAT), or `/data/.factory-reset` from the page's
+  "Erase everything" button, delete `/data/agent/admin-password` or
+  `/data/{agent,iwd,tailscale,app}`; tmpfiles recreates the folders. Keep that
+  list in sync when adding user state on /data (rauc and timesync are system
+  state and stay).
 - "Connect Tailscale" (`tailscale_login.rs`) runs `tailscale up` and shows the
   sign-in link and a QR code (qrcode crate, SVG).
 - State on `/data`: `agent/` (admin password), `iwd/`, `tailscale/{state,releases,
@@ -86,10 +93,10 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   ~60 checks: first boot on slot A (marked good, read-only root, /data grown),
   agent login and APIs, Tailscale activate/rollback, a power cut, the real
   kid-phone-server binary (fetched from GitHub on this machine) with a broken
-  update rolled back, the setup hotspot and Wi-Fi joins on three
+  update rolled back, "Erase everything" (last), the setup hotspot and Wi-Fi joins on three
   `mac80211_hwsim` radios (box; a test hostapd as the "home" AP; a test iwd as
   the "phone", with a runtime drop-in keeping the system iwd off those two),
-  a signed OS install into slot B through the agent, and
+  a password reset requested from the boot partition, a signed OS install into slot B through the agent, and
   rollback from a broken B. Run it after anything touching boot, U-Boot, RAUC,
   the kernel, systemd units or the agent. It takes ~25 min: launch it detached
   like a build. Its docstring lists the QEMU-only adaptations (U-Boot image

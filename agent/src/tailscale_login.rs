@@ -56,6 +56,14 @@ impl TailscaleLogin {
         self.state.lock().unwrap().clone()
     }
 
+    /// Signs the box out of the tailnet (before a factory reset); best effort
+    pub async fn logout(&self) {
+        let run = tokio::process::Command::new(&self.program).arg("logout").kill_on_drop(true).status();
+        if let Ok(Err(e)) = tokio::time::timeout(Duration::from_secs(20), run).await {
+            eprintln!("tailscale logout: {e}");
+        }
+    }
+
     fn found(&self, url: &str) {
         let mut state = self.state.lock().unwrap();
         if *state == Login::Starting {

@@ -1,0 +1,16 @@
+[Unit]
+Description=Recovery requests: reset the admin password or erase the box
+# Runs before anything uses /data (tmpfiles then recreates the folders it erased)
+DefaultDependencies=no
+RequiresMountsFor=/data
+After=local-fs.target
+Before=systemd-tmpfiles-setup.service sysinit.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/box/recovery
+
+[Install]
+WantedBy=sysinit.target
