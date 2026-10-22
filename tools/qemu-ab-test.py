@@ -396,6 +396,14 @@ def check_agent(con, slot):
         rc, out = con.sh("wget -T 10 -O /dev/null http://127.0.0.1:8081/ 2>&1", check=False)
         check("tailnet front, no app yet: friendly 502 page", "502" in out, out.splitlines()[-1] if out else "")
     if slot == "A":
+        code, body = agent_api(con, "/_system/settings/updates", cookie, "auto=on&tz=America%2FNew_York")
+        code, body = agent_api(con, "/_system/api/settings/updates", cookie)
+        try:
+            saved = json.loads(body.splitlines()[-1])["settings"]
+        except (ValueError, IndexError, KeyError):
+            saved = {}
+        check("night updates on, in the owner's time zone", saved == {"enabled": True, "timezone": "America/New_York"},
+              body[-200:])
         rc, _ = con.sh("test -s /etc/ssl/certs/ca-certificates.crt", check=False)
         check("CA certificates installed for HTTPS", rc == 0)
         # QEMU has no internet: the updater must run and fail cleanly, installing nothing
@@ -625,6 +633,32 @@ def check_wifi(con):
           view.get("join", {}).get("state") == "failed" and view.get("connected") == "TestHome", str(view)[:400])
 
 
+def check_firewall(con):
+    """From another network stack (a namespace on a veth link, like another
+    device on the network): the box's page answers, anything else listening
+    doesn't, and the box doesn't forward."""
+    rc, out = con.sh("nft list table inet box | grep -c 'policy drop'", check=False)
+    check("firewall loaded (input and forward drop by default)", out.splitlines()[-1:] == ["2"], out[-300:])
+    # BusyBox's ip can't name a veth's peer: the kernel calls it vethN
+    con.sh("modprobe veth; unshare -n sleep 600 >/dev/null 2>&1 & echo $! > /run/fw-peer.pid; sleep 1; "
+           "ip link add fwbox type veth && ls /sys/class/net | grep '^veth' | head -n1 > /run/fw-peer.name && "
+           "ip link set $(cat /run/fw-peer.name) netns $(cat /run/fw-peer.pid) && "
+           "ip addr add 10.9.0.1/24 dev fwbox && ip link set fwbox up && "
+           "nsenter -t $(cat /run/fw-peer.pid) -n sh -c 'ip link set lo up; "
+           "ip addr add 10.9.0.2/24 dev $(cat /run/fw-peer.name); ip link set $(cat /run/fw-peer.name) up'")
+    peer = "nsenter -t $(cat /run/fw-peer.pid) -n"
+    rc, out = con.sh(f"sleep 2; {peer} wget -q -T 10 -O - http://10.9.0.1/_system/api/health", timeout=60, check=False)
+    check("firewall lets the box's page through", out.splitlines()[-1:] == ["ok"], out[-200:])
+    # Something unexpected listening on all addresses (a stand-in for a future mistake)
+    con.sh("(echo open | nc -l -p 9999 >/dev/null 2>&1 &) ; sleep 1")
+    rc, out = con.sh("echo hi | nc -w 3 127.0.0.1 9999", check=False)
+    check("test listener answers locally", "open" in out, out[-100:])
+    con.sh("(echo open | nc -l -p 9999 >/dev/null 2>&1 &) ; sleep 1")
+    rc, out = con.sh(f"echo hi | {peer} nc -w 5 10.9.0.1 9999; echo rc=$?", timeout=60, check=False)
+    check("firewall blocks anything else listening", "open" not in out, out[-200:])
+    con.sh("kill $(cat /run/fw-peer.pid); ip link del fwbox; pkill -f '[n]c -l -p 9999'", check=False)
+
+
 def main():
     # rauc runs mksquashfs etc. from the build's host tools
     os.environ["PATH"] = f"{HOST}/bin:{SBIN}:{os.environ['PATH']}"
@@ -660,6 +694,7 @@ def main():
         check_agent(con, "A")
         check_tailscale(con)
         check_wifi(con)
+        check_firewall(con)
         con.sh("echo kept > /data/marker && sync")
     finally:
         con.stop()  # pull the power

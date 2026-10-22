@@ -12,6 +12,7 @@
 
 mod app_update;
 mod auth;
+mod autoupdate;
 mod box_api;
 mod captive_dns;
 mod http;
@@ -52,6 +53,7 @@ struct AppState {
     reboot: Arc<Vec<String>>,
     /// Asks box-recovery.service to erase the box at the next start
     factory_reset_flag: Arc<PathBuf>,
+    autoupdate: autoupdate::AutoUpdate,
 }
 
 impl AppState {
@@ -72,6 +74,7 @@ impl AppState {
             wifi: wifi::Wifi::new(wifi::Config::device()),
             reboot: Arc::new(vec!["systemctl".into(), "reboot".into()]),
             factory_reset_flag: Arc::new("/data/.factory-reset".into()),
+            autoupdate: autoupdate::AutoUpdate::new(&data_dir),
         }
     }
 }
@@ -134,6 +137,8 @@ fn router(state: AppState, front: Front) -> Router {
         .route("/_system/os/install", post(os_install_form))
         .route("/_system/restart", post(restart))
         .route("/_system/factory-reset", post(factory_reset))
+        .route("/_system/settings/updates", post(update_settings))
+        .route("/_system/api/settings/updates", get(update_settings_state))
         .route("/_system/check", post(check_form))
         .route("/_system/os/update", post(os_update_form))
         .route("/_system/api/updates", get(updates_state))
@@ -222,6 +227,8 @@ async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
         (state.app_update.installed_version(), state.app_update.initial_admin_password());
     let serve = state.tailscale_serve.lock().unwrap().clone();
     let (login, wifi) = (state.tailscale_login.state(), state.wifi.view());
+    let (auto, last_night) = (state.autoupdate.settings(), state.autoupdate.last_run());
+    let zones = state.autoupdate.zones();
     let updates = pages::Updates {
         install: &install,
         tailscale: &tailscale,
@@ -233,6 +240,9 @@ async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
         serve: &serve,
         login: &login,
         wifi: &wifi,
+        auto: &auto,
+        last_night: last_night.as_ref(),
+        zones: &zones,
     };
     Html(pages::status(&status::gather().await, &updates))
 }
@@ -304,6 +314,109 @@ async fn app_update_api(State(state): State<AppState>) -> Response {
 async fn forget_initial_password(State(state): State<AppState>) -> Redirect {
     state.app_update.forget_initial_admin_password();
     Redirect::to("/_system/")
+}
+
+#[derive(Deserialize)]
+struct UpdateSettingsForm {
+    /// The checkbox: present ("on") when ticked
+    #[serde(default)]
+    auto: String,
+    tz: String,
+}
+
+async fn update_settings(State(state): State<AppState>, Form(form): Form<UpdateSettingsForm>) -> Response {
+    match state.autoupdate.save(form.auto == "on", form.tz.trim()) {
+        Ok(()) => Redirect::to("/_system/").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Html(pages::message("Not saved", &e))).into_response(),
+    }
+}
+
+async fn update_settings_state(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(serde_json::json!({
+        "settings": state.autoupdate.settings(),
+        "last_night": state.autoupdate.last_run(),
+    }))
+}
+
+/// Waits while `busy()` holds, for up to `limit`
+async fn wait_while(busy: impl Fn() -> bool, limit: std::time::Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    while busy() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Tonight's updates (see autoupdate.rs): check, Tailscale, then the system
+/// with a restart into it. Returns what happened, in a sentence or two.
+async fn night_updates(state: &AppState) -> String {
+    use std::time::Duration;
+    let mut notes = Vec::new();
+    state.manifests.check_now();
+    wait_while(|| state.manifests.state().checking, Duration::from_secs(300)).await;
+    if let Some(error) = state.manifests.state().error {
+        notes.push(format!("Couldn't check for system updates: {error}"));
+    }
+    if state.tailscale_update.start() {
+        wait_while(|| state.tailscale_update.state().busy(), Duration::from_secs(1800)).await;
+        match state.tailscale_update.state() {
+            progress::Progress::Updated { version } => notes.push(format!("Updated Tailscale to {version}.")),
+            progress::Progress::Failed { error } => notes.push(format!("Tailscale wasn't updated: {error}")),
+            _ => {}
+        }
+    }
+    let running = std::fs::read_to_string("/etc/box-version").unwrap_or_default().trim().to_owned();
+    let newer = state
+        .manifests
+        .state()
+        .latest
+        .and_then(|m| m.os)
+        .filter(|os| manifest::os_newer(&os.version, &running));
+    let mut restart = state.os_update.state() == os_update::Install::Installed;
+    if let Some(os) = newer.filter(|_| !restart)
+        && state.os_update.start(&os.bundle_url).is_ok()
+    {
+        wait_while(
+            || matches!(state.os_update.state(), os_update::Install::Running { .. }),
+            Duration::from_secs(5400),
+        )
+        .await;
+        match state.os_update.state() {
+            os_update::Install::Installed => {
+                notes.push(format!("Installed system {}.", os.version));
+                restart = true;
+            }
+            os_update::Install::Failed { error } => {
+                notes.push(format!("The system update didn't install: {error}"))
+            }
+            _ => {}
+        }
+    }
+    if restart {
+        notes.push("Restarted to finish.".into());
+        schedule_restart(state);
+    }
+    if notes.is_empty() { "Nothing new.".into() } else { notes.join(" ") }
+}
+
+/// Runs the night updates once a night, inside the window
+fn spawn_night_updates(state: AppState) {
+    tokio::spawn(async move {
+        let mut done: Option<String> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            let settings = state.autoupdate.settings();
+            let Some((date, minute)) = autoupdate::local_now(settings.timezone.as_deref()).await else {
+                continue;
+            };
+            let start = autoupdate::start_minute(&date);
+            if !autoupdate::due(&settings, &date, minute, start, done.as_deref()) {
+                continue;
+            }
+            done = Some(date.clone());
+            let summary = night_updates(&state).await;
+            state.autoupdate.record(&date, summary);
+        }
+    });
 }
 
 /// Installs the app as soon as a manifest names one, if none is installed yet.
@@ -565,6 +678,7 @@ async fn main() {
     let state = AppState::new(args.app, args.data_dir);
     state.manifests.spawn_periodic();
     spawn_first_app_install(state.clone());
+    spawn_night_updates(state.clone());
     state.wifi.spawn();
     captive_dns::spawn(wifi::HOTSPOT_ADDRESS);
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
@@ -855,6 +969,22 @@ mod tests {
         let r = submit(&agent, "/_system/factory-reset", Some(&cookie), "confirm=yes").await;
         assert_eq!(r.status, StatusCode::OK);
         assert!(r.body.contains("Erasing") && flag.exists(), "{}", r.body);
+    }
+
+    #[tokio::test]
+    async fn saves_automatic_update_settings() {
+        let agent = start_agent(unused_port().await).await;
+        let cookie = set_up(&agent).await;
+        let r = fetch(&agent, "/_system/", Some(&cookie)).await;
+        assert!(r.body.contains("Automatic updates") && r.body.contains("name=\"tz\""), "{}", r.body);
+        let r = submit(&agent, "/_system/settings/updates", Some(&cookie), "tz=..%2Fetc%2Fpasswd").await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        // Unticked checkbox: not sent at all
+        let r = submit(&agent, "/_system/settings/updates", Some(&cookie), "tz=UTC").await;
+        assert_eq!(r.location(), "/_system/");
+        let r = fetch(&agent, "/_system/api/settings/updates", Some(&cookie)).await;
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["settings"], serde_json::json!({"enabled": false, "timezone": "UTC"}));
     }
 
     #[tokio::test]

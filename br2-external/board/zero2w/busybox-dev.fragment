@@ -1,0 +1,7 @@
+# Dev images only: tools the QEMU test uses to reach the box from a separate
+# network namespace (firewall checks)
+CONFIG_NC=y
+CONFIG_NC_SERVER=y
+CONFIG_NC_EXTRA=y
+CONFIG_UNSHARE=y
+CONFIG_NSENTER=y

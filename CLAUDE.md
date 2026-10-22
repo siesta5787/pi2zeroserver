@@ -30,6 +30,12 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   matched by `WLANInterfaceType=ap`); `captive_dns.rs` answers every name with
   192.168.4.1 and the LAN front redirects non-`/_system` requests there. Hotspot
   start/fail messages also go to the kernel log, i.e. the Pi's screen.
+- Firewall: `box-firewall.service` loads `/etc/box/firewall.nft` (table `inet
+  box`, input and forward drop by default). Anything new that must be reachable
+  from outside needs a rule there; localhost is always allowed.
+- Night updates (`autoupdate.rs`, `night_updates` in main.rs): 2–5 am in the
+  owner's time zone (`/data/agent/settings.json`), checks, Tailscale, then the
+  system and a restart. App updates never run by themselves.
 - Recovery: `box-recovery.service` (`/usr/libexec/box/recovery`) runs before
   anything uses /data. `reset-password*` / `factory-reset*` files on the boot
   partition (`/dev/mmcblk0p1`, FAT), or `/data/.factory-reset` from the page's
@@ -194,8 +200,14 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   reflashing dev devices. Never commit anything from `local/` except the README
   and example. The repo is public: audit history before pushing anything secret-
   looking.
-- Release builds will require `BOX_RAUC_KEY`/`BOX_RAUC_CERT` and `BOX_MANIFEST_KEY`
-  from outside the repo.
+- Release builds (`./build.sh release`, `box_release_defconfig`) require
+  `BOX_RAUC_KEY`/`BOX_RAUC_CERT` and `BOX_MANIFEST_KEY` from outside the repo:
+  `tools/make-release-keys.sh [folder]` makes them and writes their paths to
+  `local/release.env`, which build.sh and publish-release.sh read. Never put
+  them in the repo; a box only trusts the keys its image was built with.
+- `box_dev_defconfig` and `box_release_defconfig` differ only in login,
+  the curl command and the dev BusyBox fragment (`busybox-dev.fragment`: nc,
+  unshare, nsenter for the QEMU test). Edit both and diff them.
 
 ## Git
 

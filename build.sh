@@ -54,6 +54,13 @@ export BOX_PROJECT_DIR="${PROJECT_DIR}"
 dirty="$(git -C "${PROJECT_DIR}" diff --quiet HEAD -- 2>/dev/null || echo -dirty)"
 export BOX_VERSION="${BOX_VERSION:-$(date -u +%Y.%m.%d.%H%M)-g$(git -C "${PROJECT_DIR}" rev-parse --short HEAD)${dirty}}"
 
+# Release keys live outside the repo; local/release.env (from
+# tools/make-release-keys.sh) says where, unless they're set in the environment
+if [ "${VARIANT}" = release ] && [ -z "${BOX_RAUC_KEY:-}" ] && [ -f "${PROJECT_DIR}/local/release.env" ]; then
+	# shellcheck source=/dev/null
+	. "${PROJECT_DIR}/local/release.env"
+fi
+
 # RAUC signing key. Dev builds get a self-signed key generated on first use;
 # devices only accept bundles signed by the key their image was built with,
 # so keep local/rauc/ backed up or dev devices will need reflashing.

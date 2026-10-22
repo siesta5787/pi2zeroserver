@@ -1,0 +1,40 @@
+#!/usr/sbin/nft -f
+# The box's firewall (box-firewall.service): only what the box offers gets in,
+# and it never forwards traffic. Its own table: Tailscale keeps its rules in
+# tables of its own, and a packet must pass both.
+table inet box
+delete table inet box
+
+table inet box {
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		ct state established,related accept
+		ct state invalid drop
+		iif "lo" accept
+
+		# Ping, and the IPv6 messages addressing needs (neighbour/router discovery)
+		ip protocol icmp accept
+		meta l4proto ipv6-icmp accept
+
+		# The box's pages: home network, and over Tailscale as http://box/
+		tcp dport 80 accept
+		# HTTPS over Tailscale (normally answered inside tailscaled already)
+		iifname "tailscale0" tcp dport 443 accept
+
+		# box.local (mDNS)
+		udp dport 5353 accept
+		# Addresses for the box itself (DHCP and DHCPv6 replies)
+		udp dport { 68, 546 } accept
+		# Setup hotspot: addresses for phones, and the box's captive DNS
+		udp dport 67 accept
+		ip daddr 192.168.4.1 udp dport 53 accept
+
+		# Tailscale's WireGuard (direct connections between devices)
+		udp dport 41641 accept
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+}

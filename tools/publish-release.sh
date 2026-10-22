@@ -28,6 +28,10 @@ while [ $# -gt 0 ]; do
 done
 
 images="${BUILD_ROOT}/output/${variant}/images"
+if [ "${variant}" = release ] && [ -z "${BOX_MANIFEST_KEY:-}" ] && [ -f "${PROJECT_DIR}/local/release.env" ]; then
+	# shellcheck source=/dev/null
+	. "${PROJECT_DIR}/local/release.env"
+fi
 key="${BOX_MANIFEST_KEY:-${PROJECT_DIR}/local/manifest/${variant}-key.pem}"
 [ -f "${key}" ] || { echo "No manifest key at ${key}" >&2; exit 1; }
 

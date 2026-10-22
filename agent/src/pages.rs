@@ -24,6 +24,10 @@ pub struct Updates<'a> {
     pub app_initial_password: Option<&'a str>,
     pub login: &'a Login,
     pub wifi: &'a wifi::View,
+    pub auto: &'a crate::autoupdate::Settings,
+    pub last_night: Option<&'a crate::autoupdate::LastRun>,
+    /// Time zones to choose from
+    pub zones: &'a [String],
 }
 
 /// Escapes text for HTML element content and attribute values.
@@ -111,7 +115,54 @@ fn update_section(u: &Updates, running: &str) -> String {
          type=\"text\" inputmode=\"url\" placeholder=\"https://.../box-....raucb\" required \
          style=\"width:100%\"></p><p><button>Install</button></p></form></details>"
     };
-    format!("<section><h2>Updates</h2>{body}{advanced}</section>")
+    format!("<section><h2>Updates</h2>{body}{}{advanced}</section>", auto_section(u))
+}
+
+/// Night-time updates: on/off and the owner's time zone
+fn auto_section(u: &Updates) -> String {
+    let a = u.auto;
+    let state = match (a.enabled, a.timezone.as_deref()) {
+        (false, _) => "<p class=\"warn\">Automatic updates are off.</p>".to_owned(),
+        (true, Some(tz)) => format!(
+            "<p class=\"ok\">System and Tailscale updates install by themselves at night \
+             (2–5 am, {} time). The box restarts if a system update needs it.</p>",
+            esc(tz)
+        ),
+        (true, None) => "<p class=\"warn\">System and Tailscale updates install by themselves at night, \
+             but the box doesn't know your time zone yet: choose it below so that's your night.</p>"
+            .to_owned(),
+    };
+    let last = u
+        .last_night
+        .map(|l| format!("<p class=\"muted\">Last run ({}): {}</p>", esc(&l.date), esc(&l.summary)))
+        .unwrap_or_default();
+    let selected = a.timezone.as_deref().unwrap_or("UTC");
+    let options: String = u
+        .zones
+        .iter()
+        .map(|z| {
+            let sel = if z == selected { " selected" } else { "" };
+            format!("<option{sel}>{}</option>", esc(z))
+        })
+        .collect();
+    // Without a saved zone, preselect the browser's (works without JavaScript too: pick by hand)
+    let guess = if a.timezone.is_none() {
+        "<script>(function(){var s=document.getElementById('tz'),z;try{z=Intl.DateTimeFormat()\
+         .resolvedOptions().timeZone}catch(e){return}for(var i=0;i<s.options.length;i++)\
+         if(s.options[i].value===z)s.selectedIndex=i})()</script>"
+    } else {
+        ""
+    };
+    format!(
+        "<h3>Automatic updates</h3>{state}{last}<details{}><summary class=\"muted\">Change</summary>\
+         <form method=\"post\" action=\"/_system/settings/updates\">\
+         <p><label><input type=\"checkbox\" name=\"auto\" value=\"on\"{}> Install system and \
+         Tailscale updates automatically at night</label></p>\
+         <p><label>Your time zone<br><select name=\"tz\" id=\"tz\">{options}</select></label></p>\
+         <p><button>Save</button></p></form></details>{guess}",
+        if a.timezone.is_none() { " open" } else { "" },
+        if a.enabled { " checked" } else { "" },
+    )
 }
 
 fn app_section(s: &Status, u: &Updates) -> String {
@@ -669,9 +720,12 @@ mod tests {
                 serve: &Default::default(),
                 login: &Login::Idle,
                 wifi: &Default::default(),
+                auto: &crate::autoupdate::Settings { enabled: true, timezone: None },
+                last_night: None,
+                zones: &[],
             },
         );
-        assert!(!html.contains("<script>") && html.contains("&lt;script&gt;"));
+        assert!(!html.contains("version <script>") && html.contains("version &lt;script&gt;"));
         assert!(html.contains("evil&lt;b&gt;"));
         assert!(html.contains("A backup copy of the system is ready"));
         assert!(html.contains("29.5 GB free of 30.0 GB"));
@@ -690,6 +744,9 @@ mod tests {
             serve: &Default::default(),
             login: &Login::Idle,
             wifi: &Default::default(),
+            auto: &crate::autoupdate::Settings { enabled: true, timezone: None },
+            last_night: None,
+            zones: &[],
         };
         update_section(&u, "2026.10.19.2244-g77ccad4")
     }
@@ -765,6 +822,9 @@ mod tests {
             })),
             login: &Login::Idle,
             wifi: Box::leak(Box::new(wifi::View::default())),
+            auto: &crate::autoupdate::Settings { enabled: true, timezone: None },
+            last_night: None,
+            zones: &[],
         };
         let html = app_section(&status(Some("box.tail1.ts.net")), &updates(Some("0.18.6"), Some("Ab<c")));
         assert!(html.contains("0.18.6 is running") && html.contains("An app update is available: 0.19.0"));

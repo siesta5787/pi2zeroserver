@@ -58,6 +58,9 @@ struct BoxStatus {
     checking: bool,
     /// An OS update is installed and waits for a restart
     restart_needed: bool,
+    /// Night-time installs of system and Tailscale updates
+    auto_updates: crate::autoupdate::Settings,
+    last_night: Option<crate::autoupdate::LastRun>,
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
@@ -95,6 +98,8 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         check_error: check.error,
         checking: check.checking,
         restart_needed: install == Install::Installed,
+        auto_updates: state.autoupdate.settings(),
+        last_night: state.autoupdate.last_run(),
     })
 }
 
@@ -213,6 +218,7 @@ mod tests {
         assert_eq!(v["app"]["version"], serde_json::Value::Null);
         assert_eq!(v["os"]["install"]["state"], "idle");
         assert_eq!(v["restart_needed"], false);
+        assert_eq!(v["auto_updates"]["enabled"], true);
 
         // No manifest yet: nothing to install, and update checks aren't configured in tests
         assert_eq!(request(&socket, "POST", "/v1/os/install").await.0, StatusCode::NOT_FOUND);

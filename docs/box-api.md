@@ -62,7 +62,9 @@ the socket. Bodies are JSON.
   "checked_at": 1792468800,
   "check_error": null,
   "checking": false,
-  "restart_needed": false
+  "restart_needed": false,
+  "auto_updates": { "enabled": true, "timezone": "America/New_York" },
+  "last_night": { "date": "2026-10-24", "summary": "Installed system 2026.10.24.0300-g1234abc. Restarted to finish." }
 }
 ```
 
@@ -75,6 +77,11 @@ the socket. Bodies are JSON.
 - `latest` values come from the box's signed release manifest, checked a minute
   after boot and about every 12 hours. `checked_at` is a Unix time; `null`
   until the first successful check.
+- `auto_updates`: whether the box installs system and Tailscale updates by
+  itself between 2 and 5 am in `timezone` (`null` until the owner picks one on
+  the box's page; then UTC), restarting after a system update. App updates are
+  never automatic. `last_night` says what the last run did (`null` before the
+  first).
 
 ### Actions
 
@@ -130,4 +137,4 @@ async fn box_api(method: &str, path: &str) -> std::io::Result<(u16, String)> {
 | `tailscale version --upstream` | `tailscale.version`; updates via `POST /v1/tailscale/update` |
 | "Reboot" → `reboot` flag | `POST /v1/restart` |
 | Watcher version / schema warnings | Not applicable: hide them when `BOX_API_SOCKET` is set |
-| Update schedule (`schedule.conf`) | Not yet: the box checks by itself; automatic overnight installs are planned on the box side |
+| Update schedule (`schedule.conf`) | `auto_updates`: the box installs system and Tailscale updates at night by itself (set on the box's page) |

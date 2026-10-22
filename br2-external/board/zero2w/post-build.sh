@@ -12,7 +12,7 @@ SYSTEMCTL="${HOST_DIR}/bin/systemctl"
 	systemd-timesyncd.service \
 	tailscaled.service box-agent.service box-health-agent.service box-app.service \
 	box-grow-data.service box-health-data.service box-health-tailscale.service \
-	box-mark-good.service box-recovery.service
+	box-mark-good.service box-recovery.service box-firewall.service
 
 install -d -m 0755 "${TARGET}/data"
 
@@ -31,7 +31,13 @@ echo "${BOX_MANIFEST_PUB}" > "${TARGET}/etc/box/manifest-key.pub"
 # no network sits in the past and update signatures look "not yet valid".
 touch "${TARGET}/usr/lib/clock-epoch"
 
-[ "${VARIANT}" = dev ] || exit 0
-
-# ---- dev builds only: console login on HDMI
-"${SYSTEMCTL}" --root="${TARGET}" enable getty@tty1.service
+if [ "${VARIANT}" = dev ]; then
+	# Dev builds: console login on HDMI
+	"${SYSTEMCTL}" --root="${TARGET}" enable getty@tty1.service
+else
+	# Release builds: no login prompt anywhere, also not the one systemd's
+	# getty generator would start on the kernel's serial console (root is locked
+	# anyway; kernel and box messages still show on the screen)
+	ln -sf /dev/null "${TARGET}/etc/systemd/system/serial-getty@.service"
+	ln -sf /dev/null "${TARGET}/etc/systemd/system/getty@.service"
+fi

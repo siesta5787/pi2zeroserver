@@ -266,6 +266,20 @@ RPi Server DIstro/          (this folder, git)
    - ✅ 6b: forgotten password and factory reset via a file on the boot
      partition, and an "Erase everything" button; QEMU test covers both.
      Later: a box name (several boxes on one network would all be box.local).
-7. Hardening: firewall, sandboxing, release defconfig (no curl CLI, no HDMI
-   console login, release signing key).
+7. Hardening.
+   - ✅ Firewall (box-firewall.service, /etc/box/firewall.nft, own nftables
+     table): in only TCP 80, HTTPS on tailscale0, mDNS, DHCP/DHCPv6 replies, the
+     hotspot's DHCP and captive DNS, Tailscale's UDP 41641, ICMP; no forwarding.
+     QEMU checks it from a separate network namespace.
+   - ✅ Night updates: between 2 and 5 am in the owner's time zone (start
+     spread over two hours per box and night), check, install a newer
+     Tailscale, then a newer system and restart. On by default; switch and
+     time zone on the status page (the browser's zone preselected). App
+     updates stay manual.
+   - ✅ box_release_defconfig: root locked, no gettys, no curl command, no dev
+     BusyBox applets. Release keys: tools/make-release-keys.sh puts them
+     outside the repo and writes local/release.env (paths) for build.sh and
+     publish-release.sh.
+   - Still open: where the owner keeps the release keys, and moving devices
+     from dev to release keys (see "Release keys").
 8. Releases: CI pipeline, signed manifest, Imager repo, novice guide.
