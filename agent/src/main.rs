@@ -26,12 +26,12 @@ mod tailscale_serve;
 mod tailscale_update;
 mod wifi;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, Form, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{ConnectInfo, Form, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
 use axum::{Router, middleware};
@@ -149,11 +149,52 @@ fn router(state: AppState, front: Front) -> Router {
         // Unknown system paths stay with the agent rather than reaching the app
         .route("/_system/{*rest}", any(|| async { StatusCode::NOT_FOUND }))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard));
-    let app = match front {
-        Front::Lan => Router::new().fallback(app_on_tailnet),
-        Front::Tailnet => Router::new().fallback(proxy::forward),
-    };
-    Router::new().merge(system).merge(app).with_state(state)
+    match front {
+        Front::Lan => Router::new()
+            .merge(system)
+            .fallback(app_on_tailnet)
+            .layer(middleware::from_fn_with_state(state.clone(), tailnet_to_https))
+            .with_state(state),
+        Front::Tailnet => Router::new().merge(system).fallback(proxy::forward).with_state(state),
+    }
+}
+
+/// Tailscale's addresses: 100.64.0.0/10 and fd7a:115c:a1e0::/48
+fn is_tailscale(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && b & 0xc0 == 64
+        }
+        IpAddr::V6(v6) => {
+            v6.to_ipv4_mapped().is_some_and(|v4| is_tailscale(v4.into()))
+                || v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0]
+        }
+    }
+}
+
+/// Where a tailnet visitor of the home-network front should go instead: port 80
+/// also answers over Tailscale (as http://box/ with MagicDNS); once the HTTPS
+/// address works, send them there
+fn tailnet_https_url(peer: IpAddr, serve: &tailscale_serve::Serve, path: &str) -> Option<String> {
+    let name = serve.dns_name.as_deref().filter(|_| serve.configured && is_tailscale(peer))?;
+    Some(format!("https://{name}{path}"))
+}
+
+async fn tailnet_to_https(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: middleware::Next,
+) -> Response {
+    if matches!(*req.method(), Method::GET | Method::HEAD) {
+        let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let serve = state.tailscale_serve.lock().unwrap().clone();
+        if let Some(url) = tailnet_https_url(peer.ip(), &serve, path) {
+            return (StatusCode::FOUND, [(header::LOCATION, url)]).into_response();
+        }
+    }
+    next.run(req).await
 }
 
 async fn app_on_tailnet(State(state): State<AppState>) -> Response {
@@ -902,6 +943,27 @@ mod tests {
         assert!(r.body.contains("Connect this phone back to <b>Home &lt;5G&gt;</b>"), "{}", r.body);
         let r = submit(&lan, "/_system/wifi/join", Some(&cookie), "ssid=Other&password=long+enough").await;
         assert_eq!(r.status, StatusCode::CONFLICT, "one join at a time");
+    }
+
+    #[test]
+    fn tailnet_visitors_go_to_https() {
+        let serve = tailscale_serve::Serve {
+            configured: true,
+            error: None,
+            dns_name: Some("box.tail1234.ts.net".into()),
+        };
+        let ts: IpAddr = "100.101.102.103".parse().unwrap();
+        assert_eq!(
+            tailnet_https_url(ts, &serve, "/_system/?x=1").as_deref(),
+            Some("https://box.tail1234.ts.net/_system/?x=1")
+        );
+        assert!(tailnet_https_url("fd7a:115c:a1e0::5".parse().unwrap(), &serve, "/").is_some());
+        // The home network stays on the box's own address
+        assert!(tailnet_https_url("192.168.1.20".parse().unwrap(), &serve, "/").is_none());
+        assert!(tailnet_https_url("100.128.0.1".parse().unwrap(), &serve, "/").is_none());
+        // Until HTTPS works, tailnet visitors are served here
+        let no_https = tailscale_serve::Serve { configured: false, ..serve };
+        assert!(tailnet_https_url(ts, &no_https, "/").is_none());
     }
 
     #[tokio::test]

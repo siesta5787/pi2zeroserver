@@ -385,7 +385,26 @@ pub fn wifi_leaving(ssid: &str) -> String {
     )
 }
 
-/// The Tailscale section's sign-in part, while Tailscale isn't connected
+/// Where to find these pages over Tailscale: box.local doesn't open on a phone
+/// while its Tailscale is turned on
+fn settings_address(ts: &Tailscale, serve: &crate::tailscale_serve::Serve) -> String {
+    let Some(name) = ts.dns_name.as_deref() else {
+        return String::new();
+    };
+    let short = esc(name.split('.').next().unwrap_or(name));
+    let (url, also) = if serve.configured {
+        (format!("https://{}/_system/", esc(name)), format!(" (or just <b>http://{short}/</b>)"))
+    } else {
+        (format!("http://{short}/_system/"), String::new())
+    };
+    format!(
+        "<p>These settings, from anywhere: <a href=\"{url}\"><b>{url}</b></a>{also}. Bookmark it.</p>\
+         <p class=\"muted\">That works on any of your devices with Tailscale turned on, at home or away. \
+         <b>box.local</b> only works on your home Wi-Fi with Tailscale turned off.</p>"
+    )
+}
+
+/// The Tailscale section's sign-in part, and where to find the box once connected
 fn tailscale_connect(ts: &Tailscale, u: &Updates) -> String {
     let signed_out = matches!(ts.backend_state.as_deref(), Some("NeedsLogin" | "NoState" | "Stopped"));
     let button = "<p>Tailscale lets your own devices reach the app securely from anywhere. \
@@ -397,12 +416,15 @@ fn tailscale_connect(ts: &Tailscale, u: &Updates) -> String {
             "<p>Sign in to Tailscale to add the box to your devices:</p>\
              <p><a href=\"{0}\" target=\"_blank\" rel=\"noopener\"><b>Sign in to Tailscale</b></a></p>\
              <p class=\"muted\">Or scan this with another phone or tablet:</p>{1}\
-             <p class=\"muted\">This page updates by itself once you've signed in.</p>",
+             <p class=\"muted\">This page updates by itself once you've signed in.</p>\
+             <p class=\"muted\">Once you have Tailscale on this phone too, <b>box.local</b> won't open while \
+             it's turned on: use <b>http://box/_system/</b> instead.</p>",
             esc(url),
             crate::tailscale_login::qr_svg(url)
                 .map(|svg| format!("<div style=\"max-width:240px\">{svg}</div>"))
                 .unwrap_or_default()
         ),
+        _ if ts.backend_state.as_deref() == Some("Running") => settings_address(ts, u.serve),
         _ if ts.running && !signed_out => String::new(),
         _ if u.wifi.hotspot.is_some() => {
             "<p class=\"muted\">Connect the box to your Wi-Fi first.</p>".to_owned()
@@ -712,7 +734,10 @@ mod tests {
             app: &Progress::Idle,
             app_installed: installed,
             app_initial_password: password,
-            serve: Box::leak(Box::new(crate::tailscale_serve::Serve { configured: true, error: None })),
+            serve: Box::leak(Box::new(crate::tailscale_serve::Serve {
+                configured: true,
+                ..Default::default()
+            })),
             login: &Login::Idle,
             wifi: Box::leak(Box::new(wifi::View::default())),
         };
@@ -723,6 +748,20 @@ mod tests {
         assert!(!current.contains("update is available") && !current.contains("First sign-in"));
         let fresh = app_section(&status(None), &updates(None, None));
         assert!(fresh.contains("Not installed yet") && !fresh.contains("update is available"));
+    }
+
+    #[test]
+    fn tells_where_the_settings_are_over_tailscale() {
+        use crate::tailscale_serve::Serve;
+        let ts = Tailscale { dns_name: Some("box.tail1234.ts.net".into()), ..Default::default() };
+        let https = settings_address(&ts, &Serve { configured: true, ..Default::default() });
+        assert!(
+            https.contains("href=\"https://box.tail1234.ts.net/_system/\"") && https.contains("http://box/")
+        );
+        // Before HTTPS certificates are on, the short name over Tailscale
+        let plain = settings_address(&ts, &Serve::default());
+        assert!(plain.contains("href=\"http://box/_system/\"") && !plain.contains("https://"));
+        assert!(settings_address(&Tailscale::default(), &Serve::default()).is_empty());
     }
 
     #[test]

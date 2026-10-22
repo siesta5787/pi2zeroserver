@@ -16,6 +16,8 @@ pub struct Serve {
     pub configured: bool,
     /// Why the last attempt failed
     pub error: Option<String>,
+    /// The box's name on the tailnet (box.tailXXXX.ts.net), once connected
+    pub dns_name: Option<String>,
 }
 
 pub type Shared = Arc<Mutex<Serve>>;
@@ -34,12 +36,21 @@ async fn output(args: &[&str]) -> Result<std::process::Output, String> {
     }
 }
 
-async fn ensure(target: &str) -> Result<(), String> {
+/// The box's tailnet name from `tailscale status --json`, if it's connected
+async fn dns_name() -> Result<String, String> {
     let status = output(&["status", "--json"]).await?;
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap_or_default();
     if status["BackendState"] != "Running" {
         return Err("Tailscale isn't connected yet".into());
     }
+    status["Self"]["DNSName"]
+        .as_str()
+        .map(|n| n.trim_end_matches('.').to_owned())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| "Tailscale hasn't given the box a name yet".into())
+}
+
+async fn ensure(target: &str) -> Result<(), String> {
     let current = output(&["serve", "status", "--json"]).await?;
     if serves(&String::from_utf8_lossy(&current.stdout), target) {
         return Ok(());
@@ -59,11 +70,13 @@ pub fn spawn(shared: Shared, tailnet_front: SocketAddr) {
     let target = format!("http://{tailnet_front}");
     tokio::spawn(async move {
         loop {
-            let result = ensure(&target).await;
-            *shared.lock().unwrap() = match result {
-                Ok(()) => Serve { configured: true, error: None },
-                Err(e) => Serve { configured: false, error: Some(e) },
+            let name = dns_name().await;
+            let result = match &name {
+                Ok(_) => ensure(&target).await,
+                Err(e) => Err(e.clone()),
             };
+            *shared.lock().unwrap() =
+                Serve { configured: result.is_ok(), error: result.err(), dns_name: name.ok() };
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });

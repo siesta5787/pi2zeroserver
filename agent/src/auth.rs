@@ -182,18 +182,18 @@ pub fn clear_cookie() -> String {
 /// True if a state-changing request came from a page served by this box:
 /// browsers send Origin (or at least Referer) on form posts.
 fn same_origin(headers: &HeaderMap) -> bool {
-    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+    let header = |name| headers.get(name).and_then(|v: &axum::http::HeaderValue| v.to_str().ok());
+    // X-Forwarded-Host: the name the browser used if a proxy (tailscale serve)
+    // changed Host. Browsers can't add it to cross-site requests.
+    let hosts = [header(header::HOST.as_str()), header("x-forwarded-host")];
+    let source = header(header::ORIGIN.as_str()).or_else(|| header(header::REFERER.as_str()));
+    let Some(origin_host) = source
+        .and_then(|url| url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")))
+        .and_then(|rest| rest.split('/').next())
+    else {
         return false;
     };
-    let source =
-        headers.get(header::ORIGIN).or_else(|| headers.get(header::REFERER)).and_then(|v| v.to_str().ok());
-    match source {
-        Some(url) => {
-            let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"));
-            rest.map(|r| r.split('/').next() == Some(host)).unwrap_or(false)
-        }
-        None => false,
-    }
+    hosts.into_iter().flatten().any(|h| h == origin_host)
 }
 
 /// Paths reachable without logging in (the bare /_system only redirects)
@@ -267,6 +267,14 @@ mod tests {
             ("origin", "http://box.local.evil.example")
         ])));
         assert!(!same_origin(&headers(&[("host", "box.local")])));
+        // Through tailscale serve, over HTTPS
+        let ts = "box.tail1234.ts.net";
+        assert!(same_origin(&headers(&[("host", ts), ("origin", "https://box.tail1234.ts.net")])));
+        assert!(same_origin(&headers(&[
+            ("host", "127.0.0.1:8081"),
+            ("x-forwarded-host", ts),
+            ("origin", "https://box.tail1234.ts.net")
+        ])));
     }
 
     #[test]

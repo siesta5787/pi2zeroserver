@@ -9,7 +9,10 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
 
 - `agent/` (Rust, `box-agent`, in the read-only image) is the front door:
   - port 80 on the home LAN: `/_system/` only (setup, status, updates, behind the
-    admin password); other paths say "open the app over Tailscale";
+    admin password); other paths say "open the app over Tailscale". Port 80 also
+    answers over Tailscale (`http://box/` via MagicDNS, handy because phones
+    can't resolve box.local while their Tailscale is on); once HTTPS works,
+    those visitors are redirected to `https://box.<tailnet>.ts.net/...`;
   - `127.0.0.1:8081`, the tailnet front: `/_system/` plus a reverse proxy to the
     app (127.0.0.1:3100) with `X-Forwarded-Proto: https`. The agent publishes it
     with `tailscale serve --bg --https=443` once Tailscale is connected;
