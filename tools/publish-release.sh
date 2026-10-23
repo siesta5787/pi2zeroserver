@@ -3,10 +3,15 @@
 # also pins the app. Devices find it at
 #   https://github.com/siesta5787/pi2zeroserver/releases/latest/download/manifest.json
 #
-# Usage: tools/publish-release.sh [--app-tag vX.Y.Z] [--allow-dirty] [--dry-run] [variant]
+# Usage: tools/publish-release.sh [--app-tag vX.Y.Z] [--prerelease] [--allow-dirty] [--dry-run] [variant]
 #   --app-tag      kid-phone-server release to pin (default: its latest release)
+#   --prerelease   a test version: only boxes whose owner opted in ("Get test
+#                  versions early") install it. Published as a GitHub
+#                  pre-release (never "latest"), and the rolling `testing`
+#                  pre-release gets its manifest, which those boxes also read.
 #   --allow-dirty  publish a build made from uncommitted changes
 #   --dry-run      write and verify the manifest, but don't create the release
+# variant: dev (default) or release; release reads its key from local/release.env
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,11 +20,12 @@ REPO="siesta5787/pi2zeroserver"
 APP_REPO="siesta5787/kid-phone-server"
 APP_ASSET="kid-phone-server-aarch64-unknown-linux-musl.tar.gz"
 
-app_tag="" allow_dirty="" dry_run="" variant=dev
+app_tag="" allow_dirty="" dry_run="" prerelease="" variant=dev
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--app-tag) app_tag="$2"; shift ;;
 	--allow-dirty) allow_dirty=1 ;;
+	--prerelease) prerelease=1 ;;
 	--dry-run) dry_run=1 ;;
 	-*) echo "unknown option $1" >&2; exit 2 ;;
 	*) variant="$1" ;;
@@ -82,7 +88,22 @@ if [ -n "${dry_run}" ]; then
 	exit 0
 fi
 
-gh release create "${tag}" -R "${REPO}" --title "Box ${os_version}" \
-	--notes "OS ${os_version}; app kid-phone-server ${app_tag}" \
-	"${bundle}" "${work}/manifest.json" "${work}/manifest.json.sig"
-echo "Published ${tag}"
+if [ -n "${prerelease}" ]; then
+	gh release create "${tag}" -R "${REPO}" --prerelease --title "Box ${os_version} (test version)" \
+		--notes "Test version: only boxes set to get test versions early install it. OS ${os_version}; app kid-phone-server ${app_tag}" \
+		"${bundle}" "${work}/manifest.json" "${work}/manifest.json.sig"
+	# Opted-in boxes read releases/download/testing/manifest.json: point it here
+	if gh release view testing -R "${REPO}" >/dev/null 2>&1; then
+		gh release upload testing -R "${REPO}" --clobber "${work}/manifest.json" "${work}/manifest.json.sig"
+	else
+		gh release create testing -R "${REPO}" --prerelease --title "Newest test version (opt-in)" \
+			--notes "Boxes set to get test versions early read this manifest. It points at the newest pre-release." \
+			"${work}/manifest.json" "${work}/manifest.json.sig"
+	fi
+	echo "Published test version ${tag} (and pointed the testing manifest at it)"
+else
+	gh release create "${tag}" -R "${REPO}" --title "Box ${os_version}" \
+		--notes "OS ${os_version}; app kid-phone-server ${app_tag}" \
+		"${bundle}" "${work}/manifest.json" "${work}/manifest.json.sig"
+	echo "Published ${tag}"
+fi

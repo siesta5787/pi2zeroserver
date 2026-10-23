@@ -24,11 +24,14 @@ pub struct Settings {
     pub enabled: bool,
     /// IANA time zone ("America/New_York"); None until the owner picks one (then UTC)
     pub timezone: Option<String>,
+    /// Also take test versions (pre-releases), see manifest.rs
+    #[serde(default)]
+    pub testing: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: true, timezone: None }
+        Self { enabled: true, timezone: None, testing: false }
     }
 }
 
@@ -158,11 +161,11 @@ impl AutoUpdate {
     }
 
     /// Saves new settings; Err if the time zone isn't one the box knows
-    pub fn save(&self, enabled: bool, timezone: &str) -> Result<(), String> {
+    pub fn save(&self, enabled: bool, timezone: &str, testing: bool) -> Result<(), String> {
         if !self.valid_zone(timezone) {
             return Err(format!("Unknown time zone {timezone:?}"));
         }
-        let settings = Settings { enabled, timezone: Some(timezone.to_owned()) };
+        let settings = Settings { enabled, timezone: Some(timezone.to_owned()), testing };
         let json = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, json)
@@ -185,7 +188,7 @@ mod tests {
 
     #[test]
     fn runs_once_a_night_inside_the_window() {
-        let on = Settings { enabled: true, timezone: Some("Europe/Berlin".into()) };
+        let on = Settings { enabled: true, timezone: Some("Europe/Berlin".into()), testing: false };
         let start = 150;
         assert!(!due(&on, "2026-10-23", 149, start, None), "not before tonight's start");
         assert!(due(&on, "2026-10-23", 150, start, None));
@@ -224,12 +227,15 @@ mod tests {
         let auto = AutoUpdate::new(dir.path()).with_zoneinfo(&zoneinfo);
         assert_eq!(auto.settings(), Settings::default());
         assert_eq!(auto.zones(), ["UTC", "America/Indiana/Knox", "America/New_York", "Europe/Paris"]);
-        assert!(auto.save(true, "Mars/Olympus").is_err());
-        assert!(auto.save(true, "../etc").is_err());
-        auto.save(false, "Europe/Paris").unwrap();
+        assert!(auto.save(true, "Mars/Olympus", false).is_err());
+        assert!(auto.save(true, "../etc", false).is_err());
+        auto.save(false, "Europe/Paris", true).unwrap();
         auto.record("2026-10-23", "Nothing new.".into());
         let reloaded = AutoUpdate::new(dir.path());
-        assert_eq!(reloaded.settings(), Settings { enabled: false, timezone: Some("Europe/Paris".into()) });
+        assert_eq!(
+            reloaded.settings(),
+            Settings { enabled: false, timezone: Some("Europe/Paris".into()), testing: true }
+        );
         assert_eq!(reloaded.last_run().unwrap().summary, "Nothing new.");
     }
 

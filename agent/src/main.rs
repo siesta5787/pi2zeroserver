@@ -322,11 +322,23 @@ struct UpdateSettingsForm {
     #[serde(default)]
     auto: String,
     tz: String,
+    /// Checkbox: test versions early
+    #[serde(default)]
+    testing: String,
 }
 
 async fn update_settings(State(state): State<AppState>, Form(form): Form<UpdateSettingsForm>) -> Response {
-    match state.autoupdate.save(form.auto == "on", form.tz.trim()) {
-        Ok(()) => Redirect::to("/_system/").into_response(),
+    let testing = form.testing == "on";
+    let was_testing = state.autoupdate.settings().testing;
+    match state.autoupdate.save(form.auto == "on", form.tz.trim(), testing) {
+        Ok(()) => {
+            state.manifests.set_testing(testing);
+            if testing != was_testing {
+                // Show what's available on the new footing straight away
+                state.manifests.check_now();
+            }
+            Redirect::to("/_system/").into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Html(pages::message("Not saved", &e))).into_response(),
     }
 }
@@ -676,6 +688,7 @@ async fn main() {
         }
     };
     let state = AppState::new(args.app, args.data_dir);
+    state.manifests.set_testing(state.autoupdate.settings().testing);
     state.manifests.spawn_periodic();
     spawn_first_app_install(state.clone());
     spawn_night_updates(state.clone());
@@ -984,7 +997,11 @@ mod tests {
         assert_eq!(r.location(), "/_system/");
         let r = fetch(&agent, "/_system/api/settings/updates", Some(&cookie)).await;
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
-        assert_eq!(v["settings"], serde_json::json!({"enabled": false, "timezone": "UTC"}));
+        assert_eq!(v["settings"], serde_json::json!({"enabled": false, "timezone": "UTC", "testing": false}));
+        let r = submit(&agent, "/_system/settings/updates", Some(&cookie), "auto=on&tz=UTC&testing=on").await;
+        assert_eq!(r.location(), "/_system/");
+        let r = fetch(&agent, "/_system/api/settings/updates", Some(&cookie)).await;
+        assert!(r.body.contains("\"testing\":true"), "{}", r.body);
     }
 
     #[tokio::test]

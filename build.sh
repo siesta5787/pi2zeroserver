@@ -95,6 +95,8 @@ fi
 BOX_MANIFEST_PUB="$(openssl pkey -in "${BOX_MANIFEST_KEY}" -pubout -outform DER | tail -c 32 | base64)"
 export BOX_MANIFEST_KEY BOX_MANIFEST_PUB
 export BOX_MANIFEST_URL="${BOX_MANIFEST_URL:-https://github.com/siesta5787/pi2zeroserver/releases/latest/download/manifest.json}"
+# Test versions, for boxes whose owner opts in (tools/publish-release.sh --prerelease)
+export BOX_MANIFEST_TESTING_URL="${BOX_MANIFEST_TESTING_URL:-https://github.com/siesta5787/pi2zeroserver/releases/download/testing/manifest.json}"
 
 OUT="${BUILD_ROOT}/output/${VARIANT}"
 MAKE=(make -C "${BUILD_ROOT}/buildroot" O="${OUT}" BR2_EXTERNAL="${BUILD_ROOT}/br2-external")

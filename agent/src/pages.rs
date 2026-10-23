@@ -132,6 +132,11 @@ fn auto_section(u: &Updates) -> String {
              but the box doesn't know your time zone yet: choose it below so that's your night.</p>"
             .to_owned(),
     };
+    let testing = if a.testing {
+        "<p class=\"warn\">This box gets test versions early (pre-releases).</p>"
+    } else {
+        ""
+    };
     let last = u
         .last_night
         .map(|l| format!("<p class=\"muted\">Last run ({}): {}</p>", esc(&l.date), esc(&l.summary)))
@@ -154,14 +159,17 @@ fn auto_section(u: &Updates) -> String {
         ""
     };
     format!(
-        "<h3>Automatic updates</h3>{state}{last}<details{}><summary class=\"muted\">Change</summary>\
+        "<h3>Automatic updates</h3>{state}{testing}{last}<details{}><summary class=\"muted\">Change</summary>\
          <form method=\"post\" action=\"/_system/settings/updates\">\
          <p><label><input type=\"checkbox\" name=\"auto\" value=\"on\"{}> Install system and \
          Tailscale updates automatically at night</label></p>\
          <p><label>Your time zone<br><select name=\"tz\" id=\"tz\">{options}</select></label></p>\
+         <p><label><input type=\"checkbox\" name=\"testing\" value=\"on\"{}> Get test versions early \
+         (pre-releases, for trying new features; may have problems)</label></p>\
          <p><button>Save</button></p></form></details>{guess}",
         if a.timezone.is_none() { " open" } else { "" },
         if a.enabled { " checked" } else { "" },
+        if a.testing { " checked" } else { "" },
     )
 }
 
@@ -238,8 +246,9 @@ fn availability(u: &Updates, running: &str) -> String {
     }
     let mut b = match check.latest.as_ref().and_then(|m| m.os.as_ref()) {
         Some(os) if os_newer(&os.version, running) => format!(
-            "<p class=\"warn\">A system update is available: {}</p>\
+            "<p class=\"warn\">A {}system update is available: {}</p>\
              <form method=\"post\" action=\"/_system/os/update\"><button>Install update</button></form>",
+            if check.testing { "test version of the " } else { "" },
             esc(&os.version)
         ),
         Some(_) => "<p class=\"ok\">The system is up to date.</p>".to_owned(),
@@ -720,7 +729,7 @@ mod tests {
                 serve: &Default::default(),
                 login: &Login::Idle,
                 wifi: &Default::default(),
-                auto: &crate::autoupdate::Settings { enabled: true, timezone: None },
+                auto: &crate::autoupdate::Settings { enabled: true, timezone: None, testing: false },
                 last_night: None,
                 zones: &[],
             },
@@ -744,7 +753,7 @@ mod tests {
             serve: &Default::default(),
             login: &Login::Idle,
             wifi: &Default::default(),
-            auto: &crate::autoupdate::Settings { enabled: true, timezone: None },
+            auto: &crate::autoupdate::Settings { enabled: true, timezone: None, testing: false },
             last_night: None,
             zones: &[],
         };
@@ -822,7 +831,7 @@ mod tests {
             })),
             login: &Login::Idle,
             wifi: Box::leak(Box::new(wifi::View::default())),
-            auto: &crate::autoupdate::Settings { enabled: true, timezone: None },
+            auto: &crate::autoupdate::Settings { enabled: true, timezone: None, testing: false },
             last_night: None,
             zones: &[],
         };

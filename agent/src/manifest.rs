@@ -6,7 +6,14 @@
 //!   /etc/box/manifest-url       https://.../releases/latest/download/manifest.json
 //!   /etc/box/manifest-key.pub   base64 of the raw 32-byte public key
 //! Anything that doesn't verify is ignored; the box keeps its last good answer.
+//!
+//! Test versions: boxes whose owner opts in ("Get test versions early") also
+//! read /etc/box/manifest-testing-url, the `testing` pre-release that
+//! tools/publish-release.sh --prerelease keeps pointing at the newest
+//! pre-release, and take whichever manifest has the newer system. GitHub's
+//! "latest" never includes pre-releases, so other boxes don't see them.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -59,10 +66,14 @@ pub struct Check {
     /// Why the most recent check failed, if it did
     pub error: Option<String>,
     pub checking: bool,
+    /// `latest` came from the test versions (the owner opted in)
+    pub testing: bool,
 }
 
 pub struct Config {
     pub url: String,
+    /// Where the newest test version's manifest is
+    pub testing_url: Option<String>,
     pub key: VerifyingKey,
 }
 
@@ -71,7 +82,11 @@ impl Config {
     pub fn device() -> Option<Self> {
         let url = std::fs::read_to_string("/etc/box/manifest-url").ok()?.trim().to_owned();
         let key = std::fs::read_to_string("/etc/box/manifest-key.pub").ok()?;
-        Some(Self { url, key: parse_key(&key).ok()? })
+        let testing_url = std::fs::read_to_string("/etc/box/manifest-testing-url")
+            .ok()
+            .map(|u| u.trim().to_owned())
+            .filter(|u| !u.is_empty());
+        Some(Self { url, testing_url, key: parse_key(&key).ok()? })
     }
 }
 
@@ -100,10 +115,35 @@ pub fn os_newer(candidate: &str, running: &str) -> bool {
     key(candidate) > key(running)
 }
 
-fn fetch(config: &Config) -> Result<Manifest, String> {
-    let body = crate::http::get(&config.url, 64 << 10)?;
-    let sig = crate::http::get(&format!("{}.sig", config.url), 1 << 10)?;
-    verify(&config.key, &body, &sig)
+fn fetch_one(key: &VerifyingKey, url: &str) -> Result<Manifest, String> {
+    let body = crate::http::get(url, 64 << 10)?;
+    let sig = crate::http::get(&format!("{url}.sig"), 1 << 10)?;
+    verify(key, &body, &sig)
+}
+
+fn os_version(m: &Manifest) -> &str {
+    m.os.as_ref().map(|os| os.version.as_str()).unwrap_or("")
+}
+
+/// The regular manifest, or the test one if it has a newer system. A missing
+/// or broken test manifest never stands in the way of regular updates.
+/// Returns the manifest and whether it's the test one.
+pub fn pick(
+    regular: Result<Manifest, String>,
+    test: Option<Result<Manifest, String>>,
+) -> Result<(Manifest, bool), String> {
+    match (regular, test) {
+        (Ok(r), Some(Ok(t))) if os_newer(os_version(&t), os_version(&r)) => Ok((t, true)),
+        (Ok(r), _) => Ok((r, false)),
+        (Err(_), Some(Ok(t))) => Ok((t, true)),
+        (Err(e), _) => Err(e),
+    }
+}
+
+fn fetch(config: &Config, testing: bool) -> Result<(Manifest, bool), String> {
+    let regular = fetch_one(&config.key, &config.url);
+    let test = config.testing_url.as_deref().filter(|_| testing).map(|url| fetch_one(&config.key, url));
+    pick(regular, test)
 }
 
 fn now() -> u64 {
@@ -114,11 +154,21 @@ fn now() -> u64 {
 pub struct Manifests {
     config: Option<Arc<Config>>,
     state: Arc<Mutex<Check>>,
+    /// The owner opted in to test versions
+    testing: Arc<AtomicBool>,
 }
 
 impl Manifests {
     pub fn new(config: Option<Config>) -> Self {
-        Self { config: config.map(Arc::new), state: Arc::new(Mutex::new(Check::default())) }
+        Self {
+            config: config.map(Arc::new),
+            state: Arc::new(Mutex::new(Check::default())),
+            testing: Default::default(),
+        }
+    }
+
+    pub fn set_testing(&self, on: bool) {
+        self.testing.store(on, Ordering::Relaxed);
     }
 
     pub fn configured(&self) -> bool {
@@ -143,15 +193,17 @@ impl Manifests {
             state.checking = true;
         }
         let state = self.state.clone();
+        let testing = self.testing.load(Ordering::Relaxed);
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || fetch(&config))
+            let result = tokio::task::spawn_blocking(move || fetch(&config, testing))
                 .await
                 .unwrap_or_else(|e| Err(format!("checker crashed: {e}")));
             let mut s = state.lock().unwrap();
             s.checking = false;
             match result {
-                Ok(manifest) => {
+                Ok((manifest, from_testing)) => {
                     s.latest = Some(manifest);
+                    s.testing = from_testing;
                     s.checked_at = Some(now());
                     s.error = None;
                 }
@@ -188,6 +240,29 @@ mod tests {
     const BODY: &str = r#"{"schema":1,
         "os":{"version":"2026.10.20.0100-gabc1234","bundle_url":"https://example.com/box.raucb"},
         "app":{"name":"kid-phone-server","version":"0.18.6","url":"https://example.com/a.tgz","sha256":"00ff"}}"#;
+
+    fn with_os(version: &str) -> Manifest {
+        Manifest {
+            schema: 1,
+            os: Some(OsRelease { version: version.into(), bundle_url: format!("https://x/{version}.raucb") }),
+            app: None,
+        }
+    }
+
+    #[test]
+    fn test_versions_only_when_newer() {
+        let stable = || Ok(with_os("2026.11.01.0300-gaaaaaaa"));
+        let newer = || Ok(with_os("2026.11.05.0300-gbbbbbbb"));
+        let older = || Ok(with_os("2026.10.20.0300-gccccccc"));
+        assert_eq!(pick(stable(), None).unwrap(), (with_os("2026.11.01.0300-gaaaaaaa"), false));
+        assert_eq!(pick(stable(), Some(newer())).unwrap(), (with_os("2026.11.05.0300-gbbbbbbb"), true));
+        // Once a regular release overtakes the test one, back to regular releases
+        assert!(!pick(stable(), Some(older())).unwrap().1);
+        // No test release (yet): regular updates carry on
+        assert!(!pick(stable(), Some(Err("404".into()))).unwrap().1);
+        assert!(pick(Err("offline".into()), Some(newer())).unwrap().1);
+        assert_eq!(pick(Err("offline".into()), Some(Err("404".into()))), Err("offline".into()));
+    }
 
     #[test]
     fn accepts_a_signed_manifest() {
@@ -237,28 +312,45 @@ mod tests {
         use axum::{Router, routing::get};
         let key = SigningKey::from_bytes(&[3; 32]);
         let (body, sig) = signed(&key, BODY);
+        let (test_body, test_sig) = signed(&key, &BODY.replace("2026.10.20.0100", "2026.11.02.0100"));
         let app = Router::new()
             .route("/manifest.json", get(move || async move { body }))
-            .route("/manifest.json.sig", get(move || async move { sig }));
+            .route("/manifest.json.sig", get(move || async move { sig }))
+            .route("/testing/manifest.json", get(move || async move { test_body }))
+            .route("/testing/manifest.json.sig", get(move || async move { test_sig }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let m = Manifests::new(Some(Config {
             url: format!("http://{addr}/manifest.json"),
+            testing_url: Some(format!("http://{addr}/testing/manifest.json")),
             key: key.verifying_key(),
         }));
-        assert!(m.check_now());
-        for _ in 0..100 {
-            if !m.state().checking {
-                break;
+        let check = |m: &Manifests| {
+            assert!(m.check_now());
+            let m = m.clone();
+            async move {
+                for _ in 0..100 {
+                    if !m.state().checking {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                m.state()
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let state = m.state();
+        };
+        let state = check(&m).await;
         assert_eq!(state.error, None);
-        assert_eq!(state.latest.unwrap().app.unwrap().name, "kid-phone-server");
-        assert!(state.checked_at.is_some());
+        assert_eq!(state.latest.as_ref().unwrap().app.as_ref().unwrap().name, "kid-phone-server");
+        assert_eq!(os_version(state.latest.as_ref().unwrap()), "2026.10.20.0100-gabc1234");
+        assert!(state.checked_at.is_some() && !state.testing);
+
+        // Opted in: the newer test version
+        m.set_testing(true);
+        let state = check(&m).await;
+        assert_eq!(os_version(state.latest.as_ref().unwrap()), "2026.11.02.0100-gabc1234");
+        assert!(state.testing);
     }
 
     #[test]

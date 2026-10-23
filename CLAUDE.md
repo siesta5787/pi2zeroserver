@@ -130,8 +130,16 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   every ~12 h. Use `--dry-run` to inspect the manifest first. Afterwards, fetch
   the manifest from that URL and verify it against the image's
   `/etc/box/manifest-key.pub`, like a device would.
-- Releases so far are signed with the dev keys in `local/`; a release key and a
-  release defconfig come with step 7. First published: `v2026.10.20.0316-gcdbc7c3`
+- Test versions: `tools/publish-release.sh --prerelease release` publishes a
+  GitHub pre-release (never "latest") and points the rolling `testing`
+  pre-release's manifest at it. Only boxes whose owner ticked "Get test versions
+  early" read that manifest (`/etc/box/manifest-testing-url`); they take
+  whichever of the two has the newer system, so a later regular release
+  overtakes it. Use this to try updates on one box before everyone gets them.
+- Release keys were made on 2026-10-22 in `~/box-release-keys` (paths in
+  `local/release.env`); the owner backs that folder up offline. Releases
+  published before then are dev-signed: release boxes ignore them, and dev
+  boxes can't verify release manifests (their check shows an error). First published: `v2026.10.20.0316-gcdbc7c3`
   (pins kid-phone-server v0.18.6).
 - The app (kid-phone-server, separate repo) is never built here; the manifest
   just pins one of its releases. See PLAN.md "The app".

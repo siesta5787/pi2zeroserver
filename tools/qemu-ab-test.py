@@ -402,8 +402,10 @@ def check_agent(con, slot):
             saved = json.loads(body.splitlines()[-1])["settings"]
         except (ValueError, IndexError, KeyError):
             saved = {}
-        check("night updates on, in the owner's time zone", saved == {"enabled": True, "timezone": "America/New_York"},
-              body[-200:])
+        check("night updates on, in the owner's time zone",
+              saved == {"enabled": True, "timezone": "America/New_York", "testing": False}, body[-200:])
+        rc, out = con.sh("cat /etc/box/manifest-testing-url", check=False)
+        check("image knows where test versions are", "releases/download/testing/manifest.json" in out, out[-150:])
         rc, _ = con.sh("test -s /etc/ssl/certs/ca-certificates.crt", check=False)
         check("CA certificates installed for HTTPS", rc == 0)
         # QEMU has no internet: the updater must run and fail cleanly, installing nothing

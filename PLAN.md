@@ -280,6 +280,9 @@ RPi Server DIstro/          (this folder, git)
      BusyBox applets. Release keys: tools/make-release-keys.sh puts them
      outside the repo and writes local/release.env (paths) for build.sh and
      publish-release.sh.
-   - Still open: where the owner keeps the release keys, and moving devices
-     from dev to release keys (see "Release keys").
+   - ✅ Release keys in ~/box-release-keys (backed up offline by the owner).
+     No separate dev channel: dev boxes move to release by reflashing.
+   - ✅ Test versions: publish-release.sh --prerelease; boxes opt in with "Get
+     test versions early" and then also read the rolling `testing`
+     pre-release's manifest, taking whichever system is newer.
 8. Releases: CI pipeline, signed manifest, Imager repo, novice guide.
