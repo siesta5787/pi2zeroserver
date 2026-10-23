@@ -93,8 +93,10 @@ impl TailscaleLogin {
 
     async fn run(&self) -> Result<(), String> {
         let timeout = format!("--timeout={}s", LOGIN_TIMEOUT.as_secs());
+        // Join the tailnet under the box's own name (box.local → box.<tailnet>.ts.net)
+        let hostname = format!("--hostname={}", crate::hostname::current());
         let mut child = tokio::process::Command::new(&self.program)
-            .args(["up", &timeout])
+            .args(["up", &timeout, &hostname])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

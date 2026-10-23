@@ -12,7 +12,8 @@ SYSTEMCTL="${HOST_DIR}/bin/systemctl"
 	systemd-timesyncd.service \
 	tailscaled.service box-agent.service box-health-agent.service box-app.service \
 	box-grow-data.service box-health-data.service box-health-tailscale.service \
-	box-mark-good.service box-recovery.service box-firewall.service
+	box-mark-good.service box-recovery.service box-firewall.service \
+	box-hostname.service
 
 install -d -m 0755 "${TARGET}/data"
 

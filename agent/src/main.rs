@@ -15,6 +15,7 @@ mod auth;
 mod autoupdate;
 mod box_api;
 mod captive_dns;
+mod hostname;
 mod http;
 mod manifest;
 mod os_update;
@@ -54,6 +55,7 @@ struct AppState {
     /// Asks box-recovery.service to erase the box at the next start
     factory_reset_flag: Arc<PathBuf>,
     autoupdate: autoupdate::AutoUpdate,
+    namer: hostname::Namer,
 }
 
 impl AppState {
@@ -75,6 +77,7 @@ impl AppState {
             reboot: Arc::new(vec!["systemctl".into(), "reboot".into()]),
             factory_reset_flag: Arc::new("/data/.factory-reset".into()),
             autoupdate: autoupdate::AutoUpdate::new(&data_dir),
+            namer: hostname::Namer::new(&data_dir),
         }
     }
 }
@@ -137,6 +140,7 @@ fn router(state: AppState, front: Front) -> Router {
         .route("/_system/os/install", post(os_install_form))
         .route("/_system/restart", post(restart))
         .route("/_system/factory-reset", post(factory_reset))
+        .route("/_system/name", post(rename))
         .route("/_system/settings/updates", post(update_settings))
         .route("/_system/api/settings/updates", get(update_settings_state))
         .route("/_system/check", post(check_form))
@@ -314,6 +318,19 @@ async fn app_update_api(State(state): State<AppState>) -> Response {
 async fn forget_initial_password(State(state): State<AppState>) -> Redirect {
     state.app_update.forget_initial_admin_password();
     Redirect::to("/_system/")
+}
+
+#[derive(Deserialize)]
+struct RenameForm {
+    name: String,
+}
+
+async fn rename(State(state): State<AppState>, Form(form): Form<RenameForm>) -> Response {
+    let signed_in = status::gather().await.tailscale.backend_state.as_deref() == Some("Running");
+    match state.namer.rename(&form.name, signed_in).await {
+        Ok(_) => Redirect::to("/_system/").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Html(pages::message("Not renamed", &e))).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -762,6 +779,7 @@ mod tests {
         });
         state.tailscale_login = tailscale_login::TailscaleLogin::new("false");
         state.factory_reset_flag = Arc::new(dir.join(".factory-reset"));
+        state.namer = hostname::Namer::inert(dir);
         state
     }
 
@@ -1002,6 +1020,20 @@ mod tests {
         assert_eq!(r.location(), "/_system/");
         let r = fetch(&agent, "/_system/api/settings/updates", Some(&cookie)).await;
         assert!(r.body.contains("\"testing\":true"), "{}", r.body);
+    }
+
+    #[tokio::test]
+    async fn renaming_checks_the_name() {
+        let agent = start_agent(unused_port().await).await;
+        let cookie = set_up(&agent).await;
+        let r = fetch(&agent, "/_system/", Some(&cookie)).await;
+        assert!(r.body.contains("action=\"/_system/name\""), "{}", r.body);
+        let r = submit(&agent, "/_system/name", Some(&cookie), "name=%21%21%21").await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        let r = submit(&agent, "/_system/name", Some(&cookie), "name=Kitchen+Box").await;
+        assert_eq!(r.location(), "/_system/");
+        let saved = std::fs::read_to_string(agent._data.path().join("hostname")).unwrap();
+        assert_eq!(saved, "kitchen-box\n");
     }
 
     #[tokio::test]

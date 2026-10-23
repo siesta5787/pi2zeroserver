@@ -429,18 +429,19 @@ pub fn wifi(w: &wifi::View, error: Option<&str>) -> String {
 /// After choosing a network from the setup hotspot, which is about to go away
 pub fn wifi_leaving(ssid: &str) -> String {
     let ssid = esc(ssid);
+    let name = esc(&crate::hostname::current());
     page(
         "Joining your Wi-Fi",
         &format!(
             "<h1>Joining {ssid}…</h1><p>The box is leaving its setup hotspot to join <b>{ssid}</b>, \
              so this page will lose its connection. Next:</p>\
              <ol><li>Connect this phone back to <b>{ssid}</b>.</li>\
-             <li>Open <a href=\"http://box.local/_system/\">http://box.local/_system/</a> \
+             <li>Open <a href=\"http://{name}.local/_system/\">http://{name}.local/_system/</a> \
              and bookmark it.</li></ol>\
              <p class=\"muted\">If the box can't join (say, the password was wrong), its setup hotspot \
              comes back within a couple of minutes: connect to it again to see what went wrong.</p>\
-             <p class=\"muted\">If box.local doesn't open (some Android phones can't use .local names), \
-             look for \"box\" in your router's list of devices and open its address instead.</p>"
+             <p class=\"muted\">If {name}.local doesn't open (some Android phones can't use .local names), \
+             look for \"{name}\" in your router's list of devices and open its address instead.</p>"
         ),
     )
 }
@@ -457,19 +458,25 @@ fn settings_address(ts: &Tailscale, serve: &crate::tailscale_serve::Serve) -> St
     } else {
         (format!("http://{short}/_system/"), String::new())
     };
+    let local = esc(&crate::hostname::current());
     format!(
         "<p>These settings, from anywhere: <a href=\"{url}\"><b>{url}</b></a>{also}. Bookmark it.</p>\
          <p class=\"muted\">That works on any of your devices with Tailscale turned on, at home or away. \
-         <b>box.local</b> only works on your home Wi-Fi with Tailscale turned off.</p>"
+         <b>{local}.local</b> only works on your home Wi-Fi with Tailscale turned off.</p>"
     )
 }
 
 /// The Tailscale section's sign-in part, and where to find the box once connected
 fn tailscale_connect(ts: &Tailscale, u: &Updates) -> String {
     let signed_out = matches!(ts.backend_state.as_deref(), Some("NeedsLogin" | "NoState" | "Stopped"));
-    let button = "<p>Tailscale lets your own devices reach the app securely from anywhere. \
-                  You'll need a (free) Tailscale account.</p>\
-                  <form method=\"post\" action=\"/_system/tailscale/login\"><button>Connect Tailscale</button></form>";
+    let name = esc(&crate::hostname::current());
+    let button = format!(
+        "<p>Tailscale lets your own devices reach the app securely from anywhere. \
+         You'll need a (free) Tailscale account.</p>\
+         <p class=\"muted\">The box joins as <b>{name}</b>; <a href=\"#name\">rename it</a> first if you like \
+         (handy with several boxes).</p>\
+         <form method=\"post\" action=\"/_system/tailscale/login\"><button>Connect Tailscale</button></form>"
+    );
     match u.login {
         Login::Starting => "<p class=\"muted\">Getting a sign-in link from Tailscale…</p>".to_owned(),
         Login::Waiting { url } => format!(
@@ -477,12 +484,13 @@ fn tailscale_connect(ts: &Tailscale, u: &Updates) -> String {
              <p><a href=\"{0}\" target=\"_blank\" rel=\"noopener\"><b>Sign in to Tailscale</b></a></p>\
              <p class=\"muted\">Or scan this with another phone or tablet:</p>{1}\
              <p class=\"muted\">This page updates by itself once you've signed in.</p>\
-             <p class=\"muted\">Once you have Tailscale on this phone too, <b>box.local</b> won't open while \
-             it's turned on: use <b>http://box/_system/</b> instead.</p>",
+             <p class=\"muted\">Once you have Tailscale on this phone too, <b>{2}.local</b> won't open while \
+             it's turned on: use <b>http://{2}/_system/</b> instead.</p>",
             esc(url),
             crate::tailscale_login::qr_svg(url)
                 .map(|svg| format!("<div style=\"max-width:240px\">{svg}</div>"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            esc(&crate::hostname::current()),
         ),
         _ if ts.backend_state.as_deref() == Some("Running") => settings_address(ts, u.serve),
         _ if ts.running && !signed_out => String::new(),
@@ -491,13 +499,37 @@ fn tailscale_connect(ts: &Tailscale, u: &Updates) -> String {
         }
         _ if !ts.running => String::new(),
         Login::Failed { error } => format!("<p class=\"warn\">Couldn't connect: {}</p>{button}", esc(error)),
-        Login::Idle => button.to_owned(),
+        Login::Idle => button,
     }
+}
+
+/// The box's name, and renaming it
+fn name_section(s: &Status) -> String {
+    let name = esc(&crate::hostname::current());
+    let tailnet = s
+        .tailscale
+        .dns_name
+        .as_deref()
+        .map(|d| format!(" and <b>{}</b> on Tailscale", esc(d)))
+        .unwrap_or_default();
+    let warning = if s.tailscale.dns_name.is_some() {
+        " Its Tailscale address changes too: update your bookmarks, and the app's address on your devices."
+    } else {
+        ""
+    };
+    format!(
+        "<section id=\"name\"><h2>Name</h2><p>This box is <b>{name}.local</b> on your home network{tailnet}.</p>\
+         <details><summary class=\"muted\">Rename</summary><form method=\"post\" action=\"/_system/name\">\
+         <p><label>New name<br><input name=\"name\" maxlength=\"63\" required autocapitalize=\"off\" \
+         placeholder=\"kitchen-box\"></label></p><p class=\"muted\">Letters, numbers and dashes \
+         (spaces become dashes).{warning}</p><p><button>Rename</button></p></form></details></section>"
+    )
 }
 
 pub fn status(s: &Status, updates: &Updates) -> String {
     let mut b = String::from("<h1>Box</h1>");
     b.push_str(&wifi_section(updates.wifi));
+    b.push_str(&name_section(s));
 
     // System
     let backup = s.os.slots.iter().find(|slot| Some(&slot.name) != s.os.booted_slot.as_ref());

@@ -22,9 +22,28 @@ pub struct Serve {
 
 pub type Shared = Arc<Mutex<Serve>>;
 
-/// True if `tailscale serve status --json` already proxies to `target`
-fn serves(status_json: &str, target: &str) -> bool {
-    status_json.contains(&format!("\"{target}\""))
+#[derive(Debug, PartialEq)]
+enum Config {
+    /// `name`:443 proxies to the target
+    Ours,
+    /// Nothing set up
+    Missing,
+    /// Set up for something else, e.g. the box's old name after a rename
+    Stale,
+}
+
+/// What `tailscale serve status --json` says about `name`:443 → `target`
+fn serve_config(status_json: &str, name: &str, target: &str) -> Config {
+    let status: serde_json::Value = serde_json::from_str(status_json).unwrap_or_default();
+    let web = status["Web"].as_object();
+    let ours = web
+        .and_then(|w| w.get(&format!("{name}:443")))
+        .is_some_and(|handlers| handlers.to_string().contains(&format!("\"{target}\"")));
+    match (ours, web.is_some_and(|w| !w.is_empty())) {
+        (true, _) => Config::Ours,
+        (false, true) => Config::Stale,
+        (false, false) => Config::Missing,
+    }
 }
 
 async fn output(args: &[&str]) -> Result<std::process::Output, String> {
@@ -50,10 +69,14 @@ async fn dns_name() -> Result<String, String> {
         .ok_or_else(|| "Tailscale hasn't given the box a name yet".into())
 }
 
-async fn ensure(target: &str) -> Result<(), String> {
+async fn ensure(name: &str, target: &str) -> Result<(), String> {
     let current = output(&["serve", "status", "--json"]).await?;
-    if serves(&String::from_utf8_lossy(&current.stdout), target) {
-        return Ok(());
+    match serve_config(&String::from_utf8_lossy(&current.stdout), name, target) {
+        Config::Ours => return Ok(()),
+        Config::Stale => {
+            output(&["serve", "reset"]).await?;
+        }
+        Config::Missing => {}
     }
     let out = output(&["serve", "--bg", "--https=443", target]).await?;
     if out.status.success() {
@@ -72,7 +95,7 @@ pub fn spawn(shared: Shared, tailnet_front: SocketAddr) {
         loop {
             let name = dns_name().await;
             let result = match &name {
-                Ok(_) => ensure(&target).await,
+                Ok(name) => ensure(name, &target).await,
                 Err(e) => Err(e.clone()),
             };
             *shared.lock().unwrap() =
@@ -90,8 +113,12 @@ mod tests {
     fn recognises_an_existing_config() {
         let json = r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"box.tail1.ts.net:443":
             {"Handlers":{"/":{"Proxy":"http://127.0.0.1:8081"}}}}}"#;
-        assert!(serves(json, "http://127.0.0.1:8081"));
-        assert!(!serves(json, "http://127.0.0.1:808"));
-        assert!(!serves("{}", "http://127.0.0.1:8081"));
+        let target = "http://127.0.0.1:8081";
+        assert_eq!(serve_config(json, "box.tail1.ts.net", target), Config::Ours);
+        assert_eq!(serve_config(json, "box.tail1.ts.net", "http://127.0.0.1:808"), Config::Stale);
+        // Renamed: the old name's config has to go
+        assert_eq!(serve_config(json, "kitchen.tail1.ts.net", target), Config::Stale);
+        assert_eq!(serve_config("{}", "box.tail1.ts.net", target), Config::Missing);
+        assert_eq!(serve_config("", "box.tail1.ts.net", target), Config::Missing);
     }
 }

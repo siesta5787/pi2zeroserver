@@ -1,0 +1,16 @@
+[Unit]
+Description=Give the box the name chosen on its page
+DefaultDependencies=no
+RequiresMountsFor=/data
+After=local-fs.target box-recovery.service
+Wants=network-pre.target
+Before=network-pre.target systemd-networkd.service systemd-resolved.service tailscaled.service sysinit.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/box/set-hostname
+
+[Install]
+WantedBy=sysinit.target

@@ -43,6 +43,12 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   `/data/{agent,iwd,tailscale,app}`; tmpfiles recreates the folders. Keep that
   list in sync when adding user state on /data (rauc and timesync are system
   state and stay).
+- Name: `/data/agent/hostname` (set on the page, `hostname.rs`), applied at boot
+  by `box-hostname.service` before networking and Tailscale, and at once with
+  sethostname() (+ `tailscale set --hostname` if signed in). Not hostnamectl:
+  hostnamed ignores a transient name while /etc/hostname (read-only) is set. Pages
+  use `hostname::current()`, never a literal "box". tailscale_serve resets a
+  serve config left under an old name.
 - "Connect Tailscale" (`tailscale_login.rs`) runs `tailscale up` and shows the
   sign-in link and a QR code (qrcode crate, SVG).
 - State on `/data`: `agent/` (admin password), `iwd/`, `tailscale/{state,releases,

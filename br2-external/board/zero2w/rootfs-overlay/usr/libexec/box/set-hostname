@@ -1,0 +1,13 @@
+#!/bin/sh
+# Gives the box the name chosen on its page (box-hostname.service), before
+# networking, mDNS and Tailscale start. Without one it stays "box" (/etc/hostname).
+f=/data/agent/hostname
+[ -f "${f}" ] || exit 0
+name=$(head -c 64 "${f}" | tr -d '\n')
+case "${name}" in
+"" | -* | *- | *[!a-z0-9-]*)
+	echo "ignoring unusable name in ${f}"
+	exit 0
+	;;
+esac
+hostname "${name}"

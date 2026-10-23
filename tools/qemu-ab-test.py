@@ -406,6 +406,9 @@ def check_agent(con, slot):
               saved == {"enabled": True, "timezone": "America/New_York", "testing": False}, body[-200:])
         rc, out = con.sh("cat /etc/box/manifest-testing-url", check=False)
         check("image knows where test versions are", "releases/download/testing/manifest.json" in out, out[-150:])
+        code, body = agent_api(con, "/_system/name", cookie, "name=Test+Box")
+        rc, out = con.sh("hostname; cat /data/agent/hostname", check=False)
+        check("renaming the box takes effect at once", out.splitlines()[-2:] == ["test-box", "test-box"], out[-100:])
         rc, _ = con.sh("test -s /etc/ssl/certs/ca-certificates.crt", check=False)
         check("CA certificates installed for HTTPS", rc == 0)
         # QEMU has no internet: the updater must run and fail cleanly, installing nothing
@@ -719,6 +722,8 @@ def main():
         check("a password reset keeps the Wi-Fi", rc == 0)
         cookie = agent_post(con, "/_system/password", f"password={ADMIN_PASSWORD}&confirm={ADMIN_PASSWORD}")
         check("a new admin password can be set", bool(cookie))
+        rc, out = con.sh("hostname", check=False)
+        check("the box's name survives a restart", out.splitlines()[-1:] == ["test-box"], out[-100:])
         check_app(con)
         version_a = con.sh("cat /etc/box-version")[1].splitlines()[-1]
 
@@ -732,6 +737,7 @@ def main():
         check("update boots slot B", booted_slot(con) == "B")
         check_slot_basics(con, "B")
         check("slot B sees the same /data", con.sh("cat /data/marker")[1].splitlines()[-1] == "kept")
+        check("the box's name survives the OS update", con.sh("hostname")[1].splitlines()[-1] == "test-box")
         check_agent(con, "B")
         # The service is up as soon as it launches; the app opens its port a bit later
         rc, out = con.sh("for i in $(seq 40); do wget -q -T 5 -O /dev/null http://127.0.0.1:3100/ && exit_ok=1 && break; "
@@ -774,6 +780,7 @@ def main():
         check("erased Tailscale waits for a new sign-in", state.splitlines()[-1:] == ["NeedsLogin"], state)
         check("an erased box asks for a new password", first_page(con).endswith("/_system/password"),
               first_page(con))
+        check("an erased box is called box again", con.sh("hostname")[1].splitlines()[-1] == "box")
         check("an erased box still runs its built-in Tailscale",
               "/usr/lib/box/tailscale/" in tailscaled_exe(con), tailscaled_exe(con))
         rc, failed = con.sh("systemctl --failed --no-legend --plain --no-pager", check=False)

@@ -265,7 +265,8 @@ RPi Server DIstro/          (this folder, git)
      prompts, the Tailscale sign-in with internet.
    - ✅ 6b: forgotten password and factory reset via a file on the boot
      partition, and an "Erase everything" button; QEMU test covers both.
-     Later: a box name (several boxes on one network would all be box.local).
+   - ✅ 6c: a name for the box (page, before Tailscale): `<name>.local`, the
+     DHCP host name, and its tailnet name (`tailscale up/set --hostname`).
 7. Hardening.
    - ✅ Firewall (box-firewall.service, /etc/box/firewall.nft, own nftables
      table): in only TCP 80, HTTPS on tailscale0, mDNS, DHCP/DHCPv6 replies, the
