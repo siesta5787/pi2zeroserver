@@ -1,4 +1,9 @@
-//! The signed release manifest: which OS and app versions are current.
+//! The signed release manifests: which system and app versions are current.
+//!
+//! The system's comes from this project's releases (below); the app's from the
+//! app's own releases (box-app.json, see app_source.rs), checked at the same
+//! time and combined into one `Check`. A system manifest's own `app` entry
+//! (older releases had one) is ignored: the app is whatever the box pinned.
 //!
 //! `manifest.json` and `manifest.json.sig` (Ed25519 over the file's exact
 //! bytes) are published with each release of this repo. The address and the
@@ -13,6 +18,7 @@
 //! pre-release, and take whichever manifest has the newer system. GitHub's
 //! "latest" never includes pre-releases, so other boxes don't see them.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -49,6 +55,25 @@ pub struct AppRelease {
     /// The binary inside the tarball; defaults to the name with - as _
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Starting environment, written on first install (missing keys added on updates)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Environment variables the box fills with a random value on first install
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+    /// What the box page shows for signing in to the app the first time
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_login: Option<FirstLogin>,
+    /// The publisher's key (base64), which signs box-app.json
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct FirstLogin {
+    pub username: String,
+    /// The secret holding the password
+    pub password: String,
 }
 
 impl AppRelease {
@@ -66,8 +91,12 @@ pub struct Check {
     /// Why the most recent check failed, if it did
     pub error: Option<String>,
     pub checking: bool,
-    /// `latest` came from the test versions (the owner opted in)
+    /// The system in `latest` is a test version (the owner opted in)
     pub testing: bool,
+    /// Why the app's releases couldn't be checked, if they couldn't
+    pub app_error: Option<String>,
+    /// The app in `latest` is a test version
+    pub app_testing: bool,
 }
 
 pub struct Config {
@@ -107,12 +136,9 @@ pub fn verify(key: &VerifyingKey, body: &[u8], sig: &[u8]) -> Result<Manifest, S
     Ok(manifest)
 }
 
-/// OS versions look like 2026.10.19.2244-g77ccad4: compare the date/time part.
+/// A newer system version (see version.rs: 0.51 > 0.50; old date versions are older than any)
 pub fn os_newer(candidate: &str, running: &str) -> bool {
-    fn key(v: &str) -> Vec<u64> {
-        v.split("-g").next().unwrap_or(v).split('.').map(|n| n.parse().unwrap_or(0)).collect()
-    }
-    key(candidate) > key(running)
+    crate::version::newer(candidate, running)
 }
 
 fn fetch_one(key: &VerifyingKey, url: &str) -> Result<Manifest, String> {
@@ -156,6 +182,8 @@ pub struct Manifests {
     state: Arc<Mutex<Check>>,
     /// The owner opted in to test versions
     testing: Arc<AtomicBool>,
+    /// The app this box runs, once chosen
+    app_source: Arc<Mutex<Option<crate::app_source::AppSource>>>,
 }
 
 impl Manifests {
@@ -164,6 +192,7 @@ impl Manifests {
             config: config.map(Arc::new),
             state: Arc::new(Mutex::new(Check::default())),
             testing: Default::default(),
+            app_source: Default::default(),
         }
     }
 
@@ -179,12 +208,22 @@ impl Manifests {
         self.state.lock().unwrap().clone()
     }
 
-    /// Starts a check in the background; false if one is already running or
-    /// update checks aren't configured.
+    pub fn set_app_source(&self, source: Option<crate::app_source::AppSource>) {
+        *self.app_source.lock().unwrap() = source;
+    }
+
+    pub fn app_source(&self) -> Option<crate::app_source::AppSource> {
+        self.app_source.lock().unwrap().clone()
+    }
+
+    /// Starts a check in the background (the system's releases and the app's);
+    /// false if one is already running or there's nothing to check.
     pub fn check_now(&self) -> bool {
-        let Some(config) = self.config.clone() else {
+        let config = self.config.clone();
+        let source = self.app_source();
+        if config.is_none() && source.is_none() {
             return false;
-        };
+        }
         {
             let mut state = self.state.lock().unwrap();
             if state.checking {
@@ -195,20 +234,49 @@ impl Manifests {
         let state = self.state.clone();
         let testing = self.testing.load(Ordering::Relaxed);
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || fetch(&config, testing))
-                .await
-                .unwrap_or_else(|e| Err(format!("checker crashed: {e}")));
+            let has_source = source.is_some();
+            let result = tokio::task::spawn_blocking(move || {
+                let os = config.map(|c| fetch(&c, testing));
+                let app = source.map(|s| crate::app_source::fetch(&s, testing));
+                (os, app)
+            })
+            .await;
             let mut s = state.lock().unwrap();
             s.checking = false;
-            match result {
-                Ok((manifest, from_testing)) => {
-                    s.latest = Some(manifest);
-                    s.testing = from_testing;
-                    s.checked_at = Some(now());
-                    s.error = None;
+            let (os, app) = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    s.error = Some(format!("checker crashed: {e}"));
+                    return;
                 }
-                Err(e) => s.error = Some(e),
+            };
+            // Each half keeps its last good answer when its check fails
+            let mut latest = s.latest.take().unwrap_or(Manifest { schema: SCHEMA, os: None, app: None });
+            let mut os_error = None;
+            match os {
+                Some(Ok((manifest, from_testing))) => {
+                    latest.os = manifest.os;
+                    s.testing = from_testing;
+                }
+                Some(Err(e)) => os_error = Some(e),
+                None => {}
             }
+            let mut app_error = None;
+            match app {
+                Some(Ok((release, from_testing))) => {
+                    latest.app = Some(release);
+                    s.app_testing = from_testing;
+                }
+                Some(Err(e)) => app_error = Some(e),
+                None if !has_source => latest.app = None,
+                None => {}
+            }
+            s.latest = Some(latest);
+            if os_error.is_none() {
+                s.checked_at = Some(now());
+            }
+            s.error = os_error;
+            s.app_error = app_error;
         });
         true
     }
@@ -309,18 +377,30 @@ mod tests {
 
     #[tokio::test]
     async fn checks_over_http() {
+        use crate::app_source::tests::{key_b64, signed_app};
         use axum::{Router, routing::get};
         let key = SigningKey::from_bytes(&[3; 32]);
         let (body, sig) = signed(&key, BODY);
         let (test_body, test_sig) = signed(&key, &BODY.replace("2026.10.20.0100", "2026.11.02.0100"));
-        let app = Router::new()
+        // The app's own releases, signed by its publisher
+        let publisher = SigningKey::from_bytes(&[9; 32]);
+        let (app, app_sig) = signed_app(&publisher, "0.19.0", "https://x/a.tgz", &"ab".repeat(32));
+        let (app_test, app_test_sig) =
+            signed_app(&publisher, "0.20.0-rc", "https://x/b.tgz", &"cd".repeat(32));
+        let app_routes = Router::new()
+            .route("/app/box-app.json", get(move || async move { app }))
+            .route("/app/box-app.json.sig", get(move || async move { app_sig }))
+            .route("/app-testing/box-app.json", get(move || async move { app_test }))
+            .route("/app-testing/box-app.json.sig", get(move || async move { app_test_sig }));
+        let router = Router::new()
             .route("/manifest.json", get(move || async move { body }))
             .route("/manifest.json.sig", get(move || async move { sig }))
             .route("/testing/manifest.json", get(move || async move { test_body }))
-            .route("/testing/manifest.json.sig", get(move || async move { test_sig }));
+            .route("/testing/manifest.json.sig", get(move || async move { test_sig }))
+            .merge(app_routes);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
         let m = Manifests::new(Some(Config {
             url: format!("http://{addr}/manifest.json"),
@@ -342,15 +422,38 @@ mod tests {
         };
         let state = check(&m).await;
         assert_eq!(state.error, None);
-        assert_eq!(state.latest.as_ref().unwrap().app.as_ref().unwrap().name, "kid-phone-server");
         assert_eq!(os_version(state.latest.as_ref().unwrap()), "2026.10.20.0100-gabc1234");
         assert!(state.checked_at.is_some() && !state.testing);
+        // No app chosen: the system manifest's own app entry doesn't count
+        assert_eq!(state.latest.as_ref().unwrap().app, None);
 
-        // Opted in: the newer test version
+        m.set_app_source(Some(crate::app_source::AppSource {
+            link: "test".into(),
+            manifest_url: format!("http://{addr}/app/box-app.json"),
+            testing_url: Some(format!("http://{addr}/app-testing/box-app.json")),
+            public_key: key_b64(&publisher),
+            name: "kid-phone-server".into(),
+        }));
+        let state = check(&m).await;
+        assert_eq!(state.app_error, None);
+        assert_eq!(state.latest.as_ref().unwrap().app.as_ref().unwrap().version, "0.19.0");
+
+        // Opted in: the newer test versions of both
         m.set_testing(true);
         let state = check(&m).await;
         assert_eq!(os_version(state.latest.as_ref().unwrap()), "2026.11.02.0100-gabc1234");
-        assert!(state.testing);
+        assert!(state.testing && state.app_testing);
+        assert_eq!(state.latest.as_ref().unwrap().app.as_ref().unwrap().version, "0.20.0-rc");
+
+        // Pinned to another publisher: the app check fails, the last good answer stays
+        m.set_app_source(Some(crate::app_source::AppSource {
+            public_key: key_b64(&SigningKey::from_bytes(&[10; 32])),
+            ..m.app_source().unwrap()
+        }));
+        let state = check(&m).await;
+        assert!(state.app_error.unwrap().contains("isn't signed with this box's app key"));
+        assert_eq!(state.latest.as_ref().unwrap().app.as_ref().unwrap().version, "0.20.0-rc");
+        assert_eq!(state.error, None, "the system check is unaffected");
     }
 
     #[test]

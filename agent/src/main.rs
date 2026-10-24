@@ -10,6 +10,7 @@
 //! It lives in the read-only OS image and only changes with OS updates, so a
 //! bad app update can never take away the page used to fix it.
 
+mod app_source;
 mod app_update;
 mod auth;
 mod autoupdate;
@@ -26,6 +27,7 @@ mod status;
 mod tailscale_login;
 mod tailscale_serve;
 mod tailscale_update;
+mod version;
 mod wifi;
 
 use std::net::{IpAddr, SocketAddr};
@@ -56,6 +58,10 @@ struct AppState {
     factory_reset_flag: Arc<PathBuf>,
     autoupdate: autoupdate::AutoUpdate,
     namer: hostname::Namer,
+    /// The app this box runs, once chosen (see app_source.rs)
+    app_source_file: Arc<PathBuf>,
+    /// A release a preinstalled image carries, installed on first boot
+    preload_dir: Arc<PathBuf>,
 }
 
 impl AppState {
@@ -78,6 +84,8 @@ impl AppState {
             factory_reset_flag: Arc::new("/data/.factory-reset".into()),
             autoupdate: autoupdate::AutoUpdate::new(&data_dir),
             namer: hostname::Namer::new(&data_dir),
+            app_source_file: Arc::new(app_source::SOURCE_FILE.into()),
+            preload_dir: Arc::new(app_source::PRELOAD_DIR.into()),
         }
     }
 }
@@ -150,6 +158,8 @@ fn router(state: AppState, front: Front) -> Router {
         .route("/_system/api/updates/check", post(check_api))
         .route("/_system/app/update", post(app_update_form))
         .route("/_system/app/initial-password/forget", post(forget_initial_password))
+        .route("/_system/app/source", post(app_source_preview))
+        .route("/_system/app/source/pin", post(app_source_pin))
         .route("/_system/api/app/update", get(app_update_state).post(app_update_api))
         .route("/_system/api/tailscale/update", get(tailscale_update_state).post(tailscale_update_api))
         .route("/_system/tailscale/update", post(tailscale_update_form))
@@ -228,8 +238,12 @@ async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
         state.manifests.state(),
         state.app_update.state(),
     );
-    let (app_installed, app_initial_password) =
-        (state.app_update.installed_version(), state.app_update.initial_admin_password());
+    let (app_installed, app_name, app_first_login) = (
+        state.app_update.installed_version(),
+        state.app_update.installed_name(),
+        state.app_update.first_login(),
+    );
+    let app_source = state.manifests.app_source();
     let serve = state.tailscale_serve.lock().unwrap().clone();
     let (login, wifi) = (state.tailscale_login.state(), state.wifi.view());
     let (auto, last_night) = (state.autoupdate.settings(), state.autoupdate.last_run());
@@ -241,7 +255,9 @@ async fn status_page(State(state): State<AppState>) -> impl IntoResponse {
         checks_configured: state.manifests.configured(),
         app: &app,
         app_installed: app_installed.as_deref(),
-        app_initial_password: app_initial_password.as_deref(),
+        app_name: app_name.as_deref(),
+        app_first_login: app_first_login.as_ref(),
+        app_source: app_source.as_ref(),
         serve: &serve,
         login: &login,
         wifi: &wifi,
@@ -317,8 +333,92 @@ async fn app_update_api(State(state): State<AppState>) -> Response {
 }
 
 async fn forget_initial_password(State(state): State<AppState>) -> Redirect {
-    state.app_update.forget_initial_admin_password();
+    state.app_update.forget_first_login();
     Redirect::to("/_system/")
+}
+
+#[derive(Deserialize)]
+struct AppLinkForm {
+    link: String,
+}
+
+/// Looks up the app behind a link and asks the owner to confirm it
+async fn app_source_preview(State(state): State<AppState>, Form(form): Form<AppLinkForm>) -> Response {
+    if state.manifests.app_source().is_some() {
+        let page = pages::message(
+            "Not changed",
+            "This box already has its app. Changing apps means reflashing the card.",
+        );
+        return (StatusCode::CONFLICT, Html(page)).into_response();
+    }
+    let looked_up = async {
+        let (shown, url, _) = app_source::parse_link(&form.link)?;
+        let (release, key) = tokio::task::spawn_blocking(move || app_source::fetch_unpinned(&url))
+            .await
+            .map_err(|e| e.to_string())??;
+        Ok::<_, String>((shown, release, key))
+    };
+    match looked_up.await {
+        Ok((shown, release, key)) => {
+            Html(pages::app_confirm(&form.link, &shown, &release, &key)).into_response()
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Html(pages::message("Couldn't find that app", &e))).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AppPinForm {
+    link: String,
+    /// The key the owner saw and confirmed
+    key: String,
+}
+
+/// Pins the confirmed app (if its key is still the one shown) and installs it
+async fn app_source_pin(State(state): State<AppState>, Form(form): Form<AppPinForm>) -> Response {
+    let pinned = async {
+        let (shown, url, testing_url) = app_source::parse_link(&form.link)?;
+        let fetch_url = url.clone();
+        let (release, key) = tokio::task::spawn_blocking(move || app_source::fetch_unpinned(&fetch_url))
+            .await
+            .map_err(|e| e.to_string())??;
+        if key != form.key.trim() {
+            return Err(
+                "The app's key changed since you looked. Look it up again and check the fingerprint.".into(),
+            );
+        }
+        let source = app_source::AppSource {
+            link: shown,
+            manifest_url: url,
+            testing_url,
+            public_key: key,
+            name: release.name.clone(),
+        };
+        app_source::pin(&state.app_source_file, &source)?;
+        Ok::<_, String>(source)
+    };
+    match pinned.await {
+        Ok(source) => {
+            eprintln!("app chosen: {} from {}", source.name, source.link);
+            state.manifests.set_app_source(Some(source));
+            // The first-install loop picks the release up from this check
+            state.manifests.check_now();
+            Redirect::to("/_system/").into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Html(pages::message("App not chosen", &e))).into_response(),
+    }
+}
+
+/// A preinstalled image's release, if it's there and signed with the pinned key
+fn preloaded(
+    dir: &std::path::Path,
+    source: &app_source::AppSource,
+) -> Result<(manifest::AppRelease, PathBuf), String> {
+    let body = std::fs::read(dir.join("box-app.json")).map_err(|e| e.to_string())?;
+    let sig = std::fs::read(dir.join("box-app.json.sig")).map_err(|e| e.to_string())?;
+    let release = app_source::verify(&app_source::parse_key(&source.public_key)?, &body, &sig)?;
+    Ok((release, dir.join("app.tgz")))
 }
 
 #[derive(Deserialize)]
@@ -465,8 +565,31 @@ fn spawn_first_app_install(state: AppState) {
         let mut last_attempt: Option<std::time::Instant> = None;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            if state.app_update.installed_version().is_some() || state.app_update.state().busy() {
+            if state.app_update.state().busy() {
                 continue;
+            }
+            if state.app_update.installed_version().is_some() {
+                // A preinstalled image's copy has done its job
+                if state.preload_dir.exists() {
+                    let _ = std::fs::remove_dir_all(state.preload_dir.as_path());
+                }
+                continue;
+            }
+            // A preinstalled image: install its copy, no internet needed
+            if let Some(source) = state.manifests.app_source()
+                && state.preload_dir.exists()
+            {
+                match preloaded(&state.preload_dir, &source) {
+                    Ok((release, tarball)) => {
+                        eprintln!("installing the preinstalled {} {}", release.name, release.version);
+                        state.app_update.start_local(release, tarball);
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("ignoring the preinstalled app: {e}");
+                        let _ = std::fs::remove_dir_all(state.preload_dir.as_path());
+                    }
+                }
             }
             if last_attempt.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3600)) {
                 continue;
@@ -715,6 +838,7 @@ async fn main() {
         }
     };
     let state = AppState::new(args.app, args.data_dir);
+    state.manifests.set_app_source(app_source::load(&state.app_source_file));
     state.manifests.set_testing(state.autoupdate.settings().testing);
     state.manifests.spawn_periodic();
     spawn_first_app_install(state.clone());
@@ -790,6 +914,8 @@ mod tests {
         state.tailscale_login = tailscale_login::TailscaleLogin::new("false");
         state.factory_reset_flag = Arc::new(dir.join(".factory-reset"));
         state.namer = hostname::Namer::inert(dir);
+        state.app_source_file = Arc::new(dir.join("box/app-source.json"));
+        state.preload_dir = Arc::new(dir.join("app/preload"));
         state
     }
 
@@ -1044,6 +1170,67 @@ mod tests {
         assert_eq!(r.location(), "/_system/");
         let saved = std::fs::read_to_string(agent._data.path().join("hostname")).unwrap();
         assert_eq!(saved, "kitchen-box\n");
+    }
+
+    #[tokio::test]
+    async fn choosing_the_app_pins_it_once() {
+        use crate::app_source::tests::{key_b64, signed_app};
+        let publisher = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let (body, sig) = signed_app(&publisher, "0.19.0", "https://x/a.tgz", &"ab".repeat(32));
+        let releases = Router::new()
+            .route("/box-app.json", get(move || async move { body }))
+            .route("/box-app.json.sig", get(move || async move { sig }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let link = format!("http://{}/box-app.json", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, releases).await.unwrap() });
+
+        let agent = start_agent(unused_port().await).await;
+        let cookie = set_up(&agent).await;
+        let r = fetch(&agent, "/_system/", Some(&cookie)).await;
+        assert!(r.body.contains("action=\"/_system/app/source\""), "asks for the app: {}", r.body);
+
+        let enc = |s: &str| s.replace(':', "%3A").replace('/', "%2F").replace('+', "%2B").replace('=', "%3D");
+        let r = submit(&agent, "/_system/app/source", Some(&cookie), &format!("link={}", enc(&link))).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+        let fingerprint = app_source::fingerprint(&key_b64(&publisher));
+        assert!(r.body.contains("kid-phone-server 0.19.0") && r.body.contains(&fingerprint), "{}", r.body);
+
+        // A key other than the one shown isn't pinned
+        let other = key_b64(&ed25519_dalek::SigningKey::from_bytes(&[1; 32]));
+        let form = |key: &str| format!("link={}&key={}", enc(&link), enc(key));
+        let r = submit(&agent, "/_system/app/source/pin", Some(&cookie), &form(&other)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        let r = submit(&agent, "/_system/app/source/pin", Some(&cookie), &form(&key_b64(&publisher))).await;
+        assert_eq!(r.location(), "/_system/", "{}", r.body);
+        let pinned = app_source::load(&agent._data.path().join("box/app-source.json")).unwrap();
+        assert_eq!((pinned.name.as_str(), pinned.public_key), ("kid-phone-server", key_b64(&publisher)));
+        let r = fetch(&agent, "/_system/", Some(&cookie)).await;
+        assert!(r.body.contains(&fingerprint) && !r.body.contains("Look it up"), "{}", r.body);
+
+        // Once chosen, that's it
+        let r = submit(&agent, "/_system/app/source", Some(&cookie), &format!("link={}", enc(&link))).await;
+        assert_eq!(r.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn preloaded_release_must_be_signed_by_the_pinned_key() {
+        use crate::app_source::tests::{key_b64, signed_app};
+        let dir = tempfile::tempdir().unwrap();
+        let publisher = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let (body, sig) = signed_app(&publisher, "0.18.6", "https://x/a.tgz", &"ab".repeat(32));
+        std::fs::write(dir.path().join("box-app.json"), body).unwrap();
+        std::fs::write(dir.path().join("box-app.json.sig"), sig).unwrap();
+        let source = |key: String| app_source::AppSource {
+            link: "x".into(),
+            manifest_url: "https://x/box-app.json".into(),
+            testing_url: None,
+            public_key: key,
+            name: "kid-phone-server".into(),
+        };
+        let (release, tarball) = preloaded(dir.path(), &source(key_b64(&publisher))).unwrap();
+        assert_eq!((release.version.as_str(), tarball), ("0.18.6", dir.path().join("app.tgz")));
+        let other = key_b64(&ed25519_dalek::SigningKey::from_bytes(&[1; 32]));
+        assert!(preloaded(dir.path(), &source(other)).is_err());
     }
 
     #[tokio::test]

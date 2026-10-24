@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::manifest::{Check, os_newer};
+use crate::manifest::{AppRelease, Check, os_newer};
 use crate::os_update::Install;
 use crate::progress::Progress;
 use crate::status::{Status, Tailscale};
@@ -20,8 +20,12 @@ pub struct Updates<'a> {
     pub checks_configured: bool,
     pub app: &'a Progress,
     pub app_installed: Option<&'a str>,
-    /// The generated first-login password, until dismissed
-    pub app_initial_password: Option<&'a str>,
+    /// The installed app's name
+    pub app_name: Option<&'a str>,
+    /// Username and generated password for the app's first sign-in, until dismissed
+    pub app_first_login: Option<&'a (String, String)>,
+    /// The app this box runs; None until the owner chooses one
+    pub app_source: Option<&'a crate::app_source::AppSource>,
     pub login: &'a Login,
     pub wifi: &'a wifi::View,
     pub auto: &'a crate::autoupdate::Settings,
@@ -165,19 +169,58 @@ fn auto_section(u: &Updates) -> String {
     )
 }
 
+/// No app chosen yet: ask for its link
+fn choose_app() -> String {
+    "<section id=\"app\"><h2>App</h2><p>This box doesn't run an app yet. Paste the link to the app \
+     it should run: usually its GitHub page.</p>\
+     <form method=\"post\" action=\"/_system/app/source\"><p><label>App link<br>\
+     <input name=\"link\" required autocapitalize=\"off\" placeholder=\"github.com/owner/app\" \
+     style=\"width:100%\"></label></p><p><button>Look it up</button></p></form>\
+     <p class=\"muted\">You choose once: the box then only runs that app, and only versions signed by its \
+     publisher. Changing apps later means reflashing the card.</p></section>"
+        .to_owned()
+}
+
+/// Confirming an app before the box pins it
+pub fn app_confirm(link: &str, shown: &str, release: &AppRelease, key: &str) -> String {
+    let name = esc(&release.name);
+    page(
+        "Choose this app?",
+        &format!(
+            "<h1>Run {name} on this box?</h1>\
+             <p><b>{name} {}</b> from <b>{}</b>.</p>\
+             <p>Publisher key fingerprint: <b><code>{}</code></b><br>\
+             <span class=\"muted\">If the app's page lists its fingerprint, check that they match.</span></p>\
+             <p class=\"warn\">This box will only ever run this app, and only versions signed with this key. \
+             Changing apps later means reflashing the card.</p>\
+             <form method=\"post\" action=\"/_system/app/source/pin\">\
+             <input type=\"hidden\" name=\"link\" value=\"{}\"><input type=\"hidden\" name=\"key\" value=\"{}\">\
+             <p><button>Install {name}</button></p></form><p><a href=\"/_system/\">Cancel</a></p>",
+            esc(&release.version),
+            esc(shown),
+            esc(&crate::app_source::fingerprint(key)),
+            esc(link),
+            esc(key),
+        ),
+    )
+}
+
 fn app_section(s: &Status, u: &Updates) -> String {
-    let mut b = String::from("<section><h2>App</h2>");
+    let Some(source) = u.app_source else {
+        return choose_app();
+    };
+    let name = u.app_name.unwrap_or(&source.name);
+    let mut b = String::from("<section id=\"app\"><h2>App</h2>");
     match u.app_installed {
         Some(v) if s.app_running => {
-            let _ = write!(b, "<p class=\"ok\">kid-phone-server {} is running.</p>", esc(v));
+            let _ = write!(b, "<p class=\"ok\">{} {} is running.</p>", esc(name), esc(v));
         }
         Some(v) => {
-            let _ =
-                write!(b, "<p class=\"warn\">kid-phone-server {} is installed but not running.</p>", esc(v));
+            let _ = write!(b, "<p class=\"warn\">{} {} is installed but not running.</p>", esc(name), esc(v));
         }
         None => {
             let release = u.manifest.latest.as_ref().and_then(|m| m.app.as_ref());
-            match (release, &u.manifest.error) {
+            match (release, &u.manifest.app_error) {
                 (Some(app), _) if !u.app.busy() => {
                     let _ = write!(
                         b,
@@ -209,15 +252,19 @@ fn app_section(s: &Status, u: &Updates) -> String {
     {
         let _ = write!(b, "<p><a href=\"https://{0}/\">Open the app at https://{0}/</a></p>", esc(name));
     }
-    if let Some(password) = u.app_initial_password {
+    if let Some((user, password)) = u.app_first_login {
         let _ = write!(
             b,
-            "<p>First sign-in to the app: username <b>admin</b>, password <b>{}</b>. \
-             It asks you to choose your own straight away.</p>\
+            "<p>First sign-in to the app: username <b>{}</b>, password <b>{}</b>. \
+             Change it in the app once you're in.</p>\
              <form method=\"post\" action=\"/_system/app/initial-password/forget\">\
              <button>I've signed in, hide this</button></form>",
+            esc(user),
             esc(password)
         );
+    }
+    if let Some(error) = u.manifest.app_error.as_deref().filter(|_| u.app_installed.is_some()) {
+        let _ = write!(b, "<p class=\"muted\">Couldn't check for app updates: {}</p>", esc(error));
     }
     let newer = u
         .manifest
@@ -244,12 +291,18 @@ fn app_section(s: &Status, u: &Updates) -> String {
     if let Some(app) = newer.filter(|_| !u.app.busy()) {
         let _ = write!(
             b,
-            "<p class=\"warn\">An app update is available: {}</p>\
+            "<p class=\"warn\">An app update is available: {}{}</p>\
              <form method=\"post\" action=\"/_system/app/update\"><button>Update the app</button></form>",
-            esc(&app.version)
+            esc(&app.version),
+            if u.manifest.app_testing { " (test version)" } else { "" }
         );
     }
-    b.push_str("</section>");
+    let _ = write!(
+        b,
+        "<p class=\"muted\">From {} · publisher key {}</p></section>",
+        esc(&source.link),
+        esc(&crate::app_source::fingerprint(&source.public_key))
+    );
     b
 }
 
@@ -571,11 +624,12 @@ pub fn status(s: &Status, updates: &Updates) -> String {
     let _ = write!(
         b,
         "<section><h2>System</h2><p class=\"ok\">Running version {}</p><p>{}</p>\
-         <p class=\"muted\">Copy {} in use · up {}</p></section>",
+         <p class=\"muted\">Copy {} in use · up {}{}</p></section>",
         esc(&s.os.version),
         backup_line,
         esc(s.os.booted_slot.as_deref().unwrap_or("?")),
         duration(s.uptime_seconds),
+        s.os.build.as_deref().map(|b| format!(" · build {}", esc(b))).unwrap_or_default(),
     );
 
     // Tailscale
@@ -764,6 +818,7 @@ mod tests {
         let s = Status {
             os: Os {
                 version: "<script>".into(),
+                build: Some("gabc1234 2026-10-24".into()),
                 booted_slot: Some("A".into()),
                 slots: vec![Slot { name: "B".into(), state: "inactive".into(), boot_status: "good".into() }],
             },
@@ -786,7 +841,9 @@ mod tests {
                 checks_configured: false,
                 app: &Progress::Idle,
                 app_installed: None,
-                app_initial_password: None,
+                app_name: None,
+                app_first_login: None,
+                app_source: None,
                 serve: &Default::default(),
                 login: &Login::Idle,
                 wifi: &Default::default(),
@@ -810,7 +867,9 @@ mod tests {
             checks_configured: true,
             app: &Progress::Idle,
             app_installed: None,
-            app_initial_password: None,
+            app_name: None,
+            app_first_login: None,
+            app_source: None,
             serve: &Default::default(),
             login: &Login::Idle,
             wifi: &Default::default(),
@@ -875,6 +934,10 @@ mod tests {
                     url: "https://x/a.tgz".into(),
                     sha256: "00".into(),
                     command: None,
+                    env: Default::default(),
+                    secrets: vec![],
+                    first_login: None,
+                    public_key: None,
                 }),
             }),
             ..Default::default()
@@ -886,7 +949,15 @@ mod tests {
             checks_configured: true,
             app: &Progress::Idle,
             app_installed: installed,
-            app_initial_password: password,
+            app_name: None,
+            app_first_login: password.map(|p| &*Box::leak(Box::new(("admin".to_owned(), p.to_owned())))),
+            app_source: Some(Box::leak(Box::new(crate::app_source::AppSource {
+                link: "github.com/siesta5787/kid-phone-server".into(),
+                manifest_url: "https://x/box-app.json".into(),
+                testing_url: None,
+                public_key: "AAAA".into(),
+                name: "kid-phone-server".into(),
+            }))),
             serve: Box::leak(Box::new(crate::tailscale_serve::Serve {
                 configured: true,
                 ..Default::default()

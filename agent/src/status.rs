@@ -19,6 +19,9 @@ pub struct Status {
 #[derive(Serialize, Debug, PartialEq, Default)]
 pub struct Os {
     pub version: String,
+    /// Commit and build time, for support (/etc/box-build)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     /// "A" or "B"; None if RAUC didn't answer
     pub booted_slot: Option<String>,
     pub slots: Vec<Slot>,
@@ -69,6 +72,7 @@ pub async fn gather() -> Status {
     );
     let mut os = rauc.as_ref().map(parse_rauc).unwrap_or_default();
     os.version = read_trimmed("/etc/box-version").unwrap_or_else(|| "unknown".into());
+    os.build = read_trimmed("/etc/box-build");
     Status {
         os,
         tailscale: tailscale.as_ref().map(parse_tailscale).unwrap_or_default(),
@@ -108,7 +112,7 @@ fn parse_rauc(v: &Value) -> Os {
         })
         .collect();
     slots.sort_by(|a, b| a.name.cmp(&b.name));
-    Os { version: String::new(), booted_slot: v["booted"].as_str().map(str::to_owned), slots }
+    Os { version: String::new(), build: None, booted_slot: v["booted"].as_str().map(str::to_owned), slots }
 }
 
 /// `tailscale status --json`: {"Version":"1.104.1-t..","BackendState":"Running",

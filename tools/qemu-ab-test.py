@@ -8,6 +8,9 @@ Boots a copy of the dev sdcard.img and checks:
      switches to slot B, which boots, is marked good and sees the same /data
   3. a broken slot B (kernel removed) uses up its tries and rolls back to slot A
   4. "Erase everything" on the box's page wipes the owner's data and restarts
+The card is made a preinstalled kid-phone-server image first (signed with a
+test app key by tools/app-release.sh, written by tools/make-app-image.sh), so
+the first boot also installs the app offline.
 Along the way: the built-in Tailscale runs, a newer release activates from
 /data (and survives the OS update), and a broken release rolls back; the real
 app runs and a broken app update rolls back; and on virtual Wi-Fi radios
@@ -161,6 +164,50 @@ def prepare_card(rootfs):
         dst.seek(partitions(card)[1][0])
         shutil.copyfileobj(src, dst)
     return card
+
+
+def preinstall_app(card):
+    """Make the card a preinstalled kid-phone-server image, the way an app
+    publisher would: sign the release with a (test) app key and write it onto
+    the card with tools/make-app-image.sh."""
+    key = os.path.join(WORK, "test-app-key.pem")
+    if not os.path.exists(key):
+        run(os.path.join(PROJECT, "tools", "app-release.sh"), "new-key", key)
+    release = os.path.join(WORK, "app-release")
+    run(os.path.join(PROJECT, "tools", "app-release.sh"), "sign", "--key", key,
+        "--spec", os.path.join(PROJECT, "docs", "examples", "kid-phone-server.box-app-spec.json"),
+        "--repo", "siesta5787/kid-phone-server", "--tag", f"v{APP_VERSION}",
+        "--tarball", app_tarball(), "--dry-run", "--out", release)
+    preinstalled = card + ".app"
+    run(os.path.join(PROJECT, "tools", "make-app-image.sh"), card, preinstalled,
+        "github.com/siesta5787/kid-phone-server", "--manifest", os.path.join(release, "box-app.json"),
+        "--tarball", app_tarball())
+    os.replace(preinstalled, card)
+
+
+def check_preinstalled(con):
+    """First boot of a preinstalled image: the agent installs the app from the
+    card (no internet in QEMU), with the environment its release describes."""
+    rc, out = con.sh("for i in $(seq 60); do [ -e /data/app/current/VERSION ] && break; sleep 3; done; "
+                     "cat /data/app/current/VERSION /data/app/current/NAME", timeout=300, check=False)
+    check("preinstalled app installed on first boot, offline", out.splitlines()[-2:] == [APP_VERSION, "kid-phone-server"],
+          out[-300:])
+    env = con.sh("cat /data/app/env", check=False)[1].splitlines()
+    login = con.sh("cat /data/app/first-login", check=False)[1]
+    password = [l for l in env if l.startswith("ADMIN_PASSWORD=")]
+    check("app environment from its release, with a generated password",
+          {"BIND_ADDR=127.0.0.1:3100", "DATABASE_URL=sqlite://data/kidphone.db"} <= set(env)
+          and len(password) == 1 and len(password[0]) == len("ADMIN_PASSWORD=") + 20
+          and '"username":"admin"' in login, f"{[l.split('=')[0] for l in env]} {login[:20]}")
+    # The agent tidies the copy away on its next round (every 30 s)
+    rc, out = con.sh("for i in $(seq 30); do [ -e /data/app/preload ] || break; sleep 3; done; "
+                     "[ -e /data/app/preload ] && echo still-there || echo gone", timeout=150, check=False)
+    check("preinstalled copy removed once installed", out.splitlines()[-1:] == ["gone"], out[-100:])
+    rc, out = con.sh("cat /data/box/app-source.json", check=False)
+    check("the image's app is pinned", '"link": "github.com/siesta5787/kid-phone-server"' in out, out[-300:])
+    rc, out = con.sh("for i in $(seq 40); do wget -q -T 5 -O /dev/null http://127.0.0.1:3100/ && echo up && break; "
+                     "sleep 3; done", timeout=200, check=False)
+    check("preinstalled app answers", out.splitlines()[-1:] == ["up"], out[-200:])
 
 
 def app_tarball():
@@ -393,9 +440,6 @@ def check_agent(con, slot):
     rc, out = con.sh("wget -q -T 10 -O - http://127.0.0.1/ | grep -c 'Open the app over Tailscale'", check=False)
     check("home network points to the app on Tailscale", rc == 0, out.splitlines()[-1] if out else "")
     if slot == "A":
-        rc, out = con.sh("wget -T 10 -O /dev/null http://127.0.0.1:8081/ 2>&1", check=False)
-        check("tailnet front, no app yet: friendly 502 page", "502" in out, out.splitlines()[-1] if out else "")
-    if slot == "A":
         code, body = agent_api(con, "/_system/settings/updates", cookie, "auto=on&tz=America%2FNew_York")
         code, body = agent_api(con, "/_system/api/settings/updates", cookie)
         try:
@@ -456,9 +500,7 @@ def stage_app(con, version, broken=False):
 
 
 def check_app(con):
-    # First install: the agent writes the environment from the image's template
-    con.sh("cp /etc/box/app.env /data/app/env && echo ADMIN_PASSWORD=qemu-test-admin >> /data/app/env "
-           "&& chmod 600 /data/app/env")
+    # Installed on the first boot (preinstalled image); activate it again by hand
     stage_app(con, APP_VERSION)
     rc, out = con.sh(f"/usr/libexec/box/app-activate {APP_VERSION}", timeout=300, check=False)
     check("kid-phone-server activates", rc == 0, out.splitlines()[-1] if out else "")
@@ -676,6 +718,7 @@ def main():
     rootfs = qemu_rootfs()
     bundle = qemu_bundle(rootfs)
     card = prepare_card(rootfs)
+    preinstall_app(card)
 
     # 1. First boot: slot A, read-only root, /data grown to fill the card
     step("first boot (QEMU's SD emulation is slow: allow ~2 minutes per boot)")
@@ -696,6 +739,7 @@ def main():
         check("/data grown to fill the card", kb > 800_000, f"{kb // 1024} MiB")
         rc, out = con.sh("ls -ld /data/iwd /data/rauc | cut -c1-10", check=False)
         check("/data state folders created", rc == 0 and out.split() == ["drwx------"] * 2, out)
+        check_preinstalled(con)
         check_agent(con, "A")
         check_tailscale(con)
         check_wifi(con)
@@ -781,6 +825,9 @@ def main():
         check("an erased box asks for a new password", first_page(con).endswith("/_system/password"),
               first_page(con))
         check("an erased box is called box again", con.sh("hostname")[1].splitlines()[-1] == "box")
+        rc, out = con.sh("cat /data/box/app-source.json; test -e /data/app/current && echo app-left", check=False)
+        check("erasing keeps the box's app choice, not the app's data",
+              "kid-phone-server" in out and "app-left" not in out, out[-200:])
         check("an erased box still runs its built-in Tailscale",
               "/usr/lib/box/tailscale/" in tailscaled_exe(con), tailscaled_exe(con))
         rc, failed = con.sh("systemctl --failed --no-legend --plain --no-pager", check=False)

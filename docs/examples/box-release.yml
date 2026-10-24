@@ -1,0 +1,54 @@
+# Copy to .github/workflows/box-release.yml in an app's repo (with its
+# box-app-spec.json at the repo root) to attach a signed box-app.json to every
+# release, so boxes running the app pick it up. See docs/box-ready-apps.md in
+# github.com/siesta5787/pi2zeroserver.
+#
+# Needs the app's signing key (tools/app-release.sh new-key) as the repository
+# secret BOX_APP_KEY (the whole PEM file). Run it after the workflow that
+# uploads the release's tarball, e.g. trigger on that workflow's completion, or
+# by hand with workflow_dispatch.
+name: Box release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to sign (e.g. v0.19.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get the box tools
+        env:
+          # A pi2zeroserver commit you've looked at: this script handles your signing key
+          BOX_TOOLS_REF: main
+        run: |
+          curl -fsSL -o app-release.sh \
+            "https://raw.githubusercontent.com/siesta5787/pi2zeroserver/${BOX_TOOLS_REF}/tools/app-release.sh"
+          chmod +x app-release.sh
+      - name: Sign and attach box-app.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOX_APP_KEY: ${{ secrets.BOX_APP_KEY }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          PRERELEASE: ${{ github.event.release.prerelease && '--prerelease' || '' }}
+        run: |
+          key="$(mktemp)"
+          printf '%s\n' "$BOX_APP_KEY" > "$key"
+          # Wait for the tarball if another workflow is still uploading it
+          for i in $(seq 30); do
+            gh release view "$TAG" --json assets -q '.assets[].name' | grep -qxF \
+              "$(jq -r .asset box-app-spec.json)" && break
+            sleep 20
+          done
+          ./app-release.sh sign --key "$key" --spec box-app-spec.json \
+            --repo "$GITHUB_REPOSITORY" --tag "$TAG" $PRERELEASE
+          rm -f "$key"

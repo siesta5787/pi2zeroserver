@@ -1,4 +1,8 @@
-# The box API (for kid-phone-server)
+# The box API (for the app)
+
+What an app needs to run on a box at all: [box-ready-apps.md](box-ready-apps.md).
+This page is the optional API it can use to show and drive the box's updates.
+Examples use kid-phone-server.
 
 On the box, kid-phone-server doesn't manage the OS itself: there's no `apt`, no
 root watcher script, and the system files are read-only. Instead the box's agent
@@ -21,8 +25,9 @@ installs on a regular Pi.
   app's own persistent folder (`/data/app/state`) and `static/` comes from the
   installed release. Everything the app writes must go under `data/`; the rest
   of the filesystem is read-only to it.
-- **First run:** the box generates `ADMIN_PASSWORD` and shows it on the box's
-  system page (`http://box.local/_system/`) until the owner hides it.
+- **First run:** the box fills the variables the app's `box-app.json` lists
+  under `secrets` (kid-phone-server: `ADMIN_PASSWORD`) and shows the
+  `first_login` one on the box's system page until the owner hides it.
 - **Not available on the box:** the flag-file watcher (`data/update_requested`)
   and its actions, `apt`, `/var/run/reboot-required`, `tailscale update`, and
   formatting external drives. Use the API below for updates and restarts.
@@ -74,7 +79,8 @@ the socket. Bodies are JSON.
 - `app.progress.state` and `tailscale.progress.state`: `idle`, `checking`,
   `downloading` (`version`, `percent`), `installing` (`version`), `updated`
   (`version`), `up_to_date` (`version`), or `failed` (`error`).
-- `latest` values come from the box's signed release manifest, checked a minute
+- `os.latest` comes from the box's signed system manifest, `app.latest` from the
+  app's own signed `box-app.json` releases; both are checked a minute
   after boot and about every 12 hours. `checked_at` is a Unix time; `null`
   until the first successful check.
 - `auto_updates`: whether the box installs system and Tailscale updates by
@@ -93,7 +99,7 @@ yet (check first).
 |---|---|
 | `POST /v1/check` | Check for updates now |
 | `POST /v1/os/install` | Install the OS update from the manifest (into the other slot; takes effect after a restart) |
-| `POST /v1/app/update` | Install the app update from the manifest. The app is restarted onto the new version; if it doesn't come up, the box restores the database and the previous version. |
+| `POST /v1/app/update` | Install the app's newest release (its box-app.json). The app is restarted onto the new version; if it doesn't come up, the box restores the database and the previous version. |
 | `POST /v1/tailscale/update` | Update Tailscale to its latest signed release (rolled back if it doesn't start) |
 | `POST /v1/restart` | Restart the box (answers first, restarts a second later) |
 

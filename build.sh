@@ -51,8 +51,15 @@ export BR2_CCACHE_DIR="${BUILD_ROOT}/cache/ccache"
 export BOX_PROJECT_DIR="${PROJECT_DIR}"
 
 # Version stamped into /etc/box-version and the RAUC bundle. Sorts by build time.
+# The system version: VERSION (0.50, 0.51, ...; test versions 0.51-test1), with
+# "-dirty" when built from uncommitted changes. Bump it for every release.
 dirty="$(git -C "${PROJECT_DIR}" diff --quiet HEAD -- 2>/dev/null || echo -dirty)"
-export BOX_VERSION="${BOX_VERSION:-$(date -u +%Y.%m.%d.%H%M)-g$(git -C "${PROJECT_DIR}" rev-parse --short HEAD)${dirty}}"
+base_version="$(tr -d '[:space:]' < "${PROJECT_DIR}/VERSION")"
+[[ "${base_version}" =~ ^[0-9]+(\.[0-9]+)+(-[A-Za-z0-9.]+)?$ ]] || {
+	echo "VERSION must look like 0.50 or 0.51-test1, not '${base_version}'" >&2; exit 1; }
+export BOX_VERSION="${BOX_VERSION:-${base_version}${dirty}}"
+# Which commit and when, for support (the status page shows it small)
+export BOX_BUILD="g$(git -C "${PROJECT_DIR}" rev-parse --short HEAD)${dirty} $(date -u +%Y-%m-%d)"
 
 # Release keys live outside the repo; local/release.env (from
 # tools/make-release-keys.sh) says where, unless they're set in the environment

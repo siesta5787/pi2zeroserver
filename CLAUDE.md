@@ -1,9 +1,11 @@
 # CLAUDE.md
 
-Buildroot-based A/B-updating appliance OS for the Raspberry Pi Zero 2 W: runs a
-static musl Rust web server (kid-phone-server, a separate repo) plus Tailscale,
-kept up to date by a non-technical user from a web page. Design, decisions and
-step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
+Buildroot-based A/B-updating appliance OS for the Raspberry Pi Zero 2 W: a
+generic base that runs one static musl Rust web app (first user: kid-phone-server,
+a separate repo) plus Tailscale, kept up to date by a non-technical user from a
+web page. Design, decisions and step status: `PLAN.md`. For app publishers:
+`docs/box-ready-apps.md` (what an app needs, signing releases, preinstalled
+images) and `docs/box-api.md` (the optional box API).
 
 ## How the box fits together
 
@@ -53,15 +55,23 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   sign-in link and a QR code (qrcode crate, SVG).
 - State on `/data`: `agent/` (admin password), `iwd/`, `tailscale/{state,releases,
   current}`, `rauc/`, `timesync/`, `app/{releases,current,state,run,env,snapshots}`.
+- The app (`app_source.rs`, `app_update.rs`): chosen once on the page (app link,
+  publisher key fingerprint shown; trust on first use) or preset by
+  `tools/make-app-image.sh`, pinned in `/data/box/app-source.json` (kept by a
+  factory reset; changing apps = reflash). Releases come from the app's repo:
+  `box-app.json` + `.sig` (Ed25519 by the app's own key, made by
+  `tools/app-release.sh`) naming the tarball, SHA-256, command, env, secrets,
+  first_login. The system manifest no longer carries the app. A preinstalled
+  image's copy waits in `/data/app/preload/` and installs offline on first boot.
 - Activation scripts in `/usr/libexec/box/` do the switch-and-health-check for
   things updated on `/data`; the agent downloads and verifies, then calls them.
   Exit status 0 activated, 1 failed and rolled back, 2 release unusable:
   `tailscale-activate <v>`, `app-activate <v>` (snapshots and restores the app's
   SQLite files too, since a newer app may migrate the DB).
-- Trust: OS bundles are checked by RAUC (`local/rauc` key), the release manifest
-  by the agent (`local/manifest` key, pinned in `/etc/box/manifest-key.pub`), the
-  app by the manifest's SHA-256, Tailscale by its distsign chain from the root
-  keys in `agent/src/tailscale-roots/`.
+- Trust: OS bundles are checked by RAUC (release key), the system manifest by the
+  agent (manifest key, pinned in `/etc/box/manifest-key.pub`), the app by its
+  publisher's key pinned per box plus the SHA-256 in its box-app.json,
+  Tailscale by its distsign chain from the root keys in `agent/src/tailscale-roots/`.
 
 ## Building
 
@@ -87,6 +97,8 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   - `boot.cmd` → `./build.sh dev host-uboot-tools-rebuild` (boot.scr is compiled
     when host-uboot-tools builds, not on every build)
   - rootfs overlay, `post-build.sh`, `post-image.sh` → plain `./build.sh dev`
+    (a file *removed* from the overlay stays in `output/<variant>/target/`:
+    delete it there too, for every variant)
   - changed a package's `_DEPENDENCIES` → `<pkg>-dirclean` (`-rebuild` doesn't
     refresh its per-package sysroot, so new libraries stay invisible)
   - `agent/` sources → `./build.sh dev box-agent-rebuild` and then `./build.sh dev`
@@ -127,11 +139,17 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
 
 ## Releasing
 
-- Commit first, then build: the version (`YYYY.MM.DD.HHMM-g<commit>`) gets
-  `-dirty` from uncommitted changes, and `tools/publish-release.sh` refuses those.
-- `tools/publish-release.sh [--app-tag vX.Y.Z] [--dry-run]` publishes the current
-  build's OS bundle plus a signed `manifest.json` (also pinning a kid-phone-server
-  release by SHA-256) as a GitHub release of this (public) repo. Devices poll
+- Versions: the `VERSION` file (0.50, 0.51, ...; test versions `0.51-test1`),
+  compared by `agent/src/version.rs` (numbers part by part; a `-suffix` comes
+  before the plain version; old date versions like `2026.10.24.1323-g...` are
+  older than any number). Bump `VERSION` for every release; publishing refuses a
+  version that's already published. Commit and build info goes to
+  `/etc/box-build` (shown small on the status page).
+- Commit first, then build: the version gets `-dirty` from uncommitted changes,
+  and `tools/publish-release.sh` refuses those.
+- `tools/publish-release.sh [--prerelease] [--dry-run] release` publishes the current
+  build's OS bundle plus a signed system `manifest.json` as a GitHub release of
+  this (public) repo. Devices poll
   `releases/latest/download/manifest.json` (+ `.sig`) a minute after boot and
   every ~12 h. Use `--dry-run` to inspect the manifest first. Afterwards, fetch
   the manifest from that URL and verify it against the image's
@@ -147,8 +165,9 @@ step status: `PLAN.md`. The app's side of the integration: `docs/box-api.md`.
   published before then are dev-signed: release boxes ignore them, and dev
   boxes can't verify release manifests (their check shows an error). First published: `v2026.10.20.0316-gcdbc7c3`
   (pins kid-phone-server v0.18.6).
-- The app (kid-phone-server, separate repo) is never built here; the manifest
-  just pins one of its releases. See PLAN.md "The app".
+- Apps are never built here. App releases are published from the app's repo
+  (`tools/app-release.sh sign`, with the app's own key); this repo's releases
+  are system-only. kid-phone-server's spec: `docs/examples/`.
 
 ## Things that bit us
 

@@ -139,10 +139,11 @@ Decided 2026-10-19. The box runs https://github.com/siesta5787/kid-phone-server
   listener) → app, with `X-Forwarded-Proto: https`, so the app's Secure cookies
   work. The home LAN (port 80) only gets the box's own `/_system/` pages; app
   paths there point people at the tailnet address.
-- **Releases: pinned by the box manifest.** This repo's signed `manifest.json`
-  names the exact app tarball (GitHub release asset) and its SHA-256; the box
-  installs nothing else. Publishing a new box manifest is what rolls out an app
-  version. The app's own release CI is unchanged.
+- **Releases: the app's own, signed by its publisher** (since 2026-10-24; before,
+  this repo's manifest pinned the app). Each kid-phone-server release gets a
+  signed `box-app.json` (tools/app-release.sh, spec in docs/examples/); boxes
+  pinned to the app take new releases independently of system releases. The box
+  is a generic base: see docs/box-ready-apps.md.
 - **Layout on /data:** `app/releases/<v>/` (binary + `static/`), `app/current` →
   active release, `app/state/` (the app's `data/`: SQLite DB, backups...),
   `app/run/` working dir with `data` → `../state` and `static` → `../current/static`,
@@ -286,4 +287,9 @@ RPi Server DIstro/          (this folder, git)
    - ✅ Test versions: publish-release.sh --prerelease; boxes opt in with "Get
      test versions early" and then also read the rolling `testing`
      pre-release's manifest, taking whichever system is newer.
-8. Releases: CI pipeline, signed manifest, Imager repo, novice guide.
+7b. ✅ Generic base: the app is chosen per box (setup page app link with
+   fingerprint, or tools/make-app-image.sh for preinstalled images) and pinned
+   in /data/box (factory reset keeps it). App releases carry their own signed
+   box-app.json (tools/app-release.sh) and update independently of the system;
+   test versions via the app repo's `box-testing` pre-release.
+8. Releases: CI pipeline, Imager repo, novice guide.

@@ -21,6 +21,7 @@ install -d -m 0755 "${TARGET}/data"
 install -D -m 0644 "${BOX_RAUC_CERT}" "${TARGET}/etc/rauc/keyring.pem"
 
 echo "${BOX_VERSION}" > "${TARGET}/etc/box-version"
+echo "${BOX_BUILD:-}" > "${TARGET}/etc/box-build"
 
 # Where to look for updates, and the key their manifest must be signed with
 install -d -m 0755 "${TARGET}/etc/box"

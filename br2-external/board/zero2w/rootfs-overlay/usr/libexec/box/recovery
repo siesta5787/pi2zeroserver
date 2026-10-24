@@ -6,6 +6,7 @@
 #
 #   reset-password*   forget the admin password (choose a new one on the box's page)
 #   factory-reset*    erase Wi-Fi, Tailscale, the app and its data, and the password
+#                     (not /data/box: which app the box runs only changes with a reflash)
 #
 # Names are matched loosely (any case; Windows may add a hidden ".txt"). A
 # request is removed only after it's done, so a power cut means it runs again.
