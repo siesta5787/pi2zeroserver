@@ -28,6 +28,8 @@ struct OsStatus {
     version: String,
     latest: Option<String>,
     update_available: bool,
+    /// `latest` is a test version (the owner opted in)
+    testing: bool,
     install: Install,
 }
 
@@ -36,6 +38,10 @@ struct AppStatus {
     version: Option<String>,
     latest: Option<String>,
     update_available: bool,
+    /// `latest` is a test version (the owner opted in)
+    testing: bool,
+    /// Why the app's releases couldn't be checked, if they couldn't
+    check_error: Option<String>,
     progress: Progress,
 }
 
@@ -77,6 +83,7 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
                 .is_some_and(|l| crate::manifest::os_newer(l, &s.os.version)),
             version: s.os.version,
             latest: latest_os,
+            testing: check.testing,
             install: install.clone(),
         },
         app: AppStatus {
@@ -86,6 +93,8 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
             },
             version: app_version,
             latest: latest_app,
+            testing: check.app_testing,
+            check_error: check.app_error.clone(),
             progress: state.app_update.state(),
         },
         tailscale: TailscaleStatus {
@@ -226,6 +235,34 @@ mod tests {
         assert_eq!(request(&socket, "POST", "/v1/check").await.0, StatusCode::CONFLICT);
         assert_eq!(request(&socket, "POST", "/v1/restart").await.0, StatusCode::ACCEPTED);
         assert_eq!(request(&socket, "GET", "/v1/nope").await.0, StatusCode::NOT_FOUND);
+    }
+
+    /// The way docs/box-api.md (and kid-phone-server) call it: plain HTTP/1.0, read to the end
+    #[tokio::test]
+    async fn answers_a_minimal_http_1_0_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("api.sock");
+        let state = crate::tests::test_state(dir.path());
+        let listener = listen(&socket, None).unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        for (method, path, code) in [("GET", "/v1/status", "200"), ("POST", "/v1/app/update", "404")] {
+            let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            let request = format!("{method} {path} HTTP/1.0\r\nHost: box\r\nContent-Length: 0\r\n\r\n");
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_string(&mut response))
+                .await
+                .expect("the connection closes when the answer is complete")
+                .unwrap();
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            assert_eq!(head.split(' ').nth(1), Some(code), "{head}");
+            if code == "200" {
+                let v: serde_json::Value =
+                    serde_json::from_str(body).expect("a plain JSON body, not chunked");
+                assert!(v["os"]["install"]["state"].is_string());
+            }
+        }
     }
 
     #[test]

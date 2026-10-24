@@ -47,15 +47,18 @@ the socket. Bodies are JSON.
 ```json
 {
   "os": {
-    "version": "2026.10.19.2354-gad264b7",
-    "latest": "2026.10.24.0300-g1234abc",
+    "version": "0.50",
+    "latest": "0.51",
     "update_available": true,
+    "testing": false,
     "install": { "state": "idle" }
   },
   "app": {
     "version": "0.18.6",
     "latest": "0.19.0",
     "update_available": true,
+    "testing": false,
+    "check_error": null,
     "progress": { "state": "idle" }
   },
   "tailscale": {
@@ -68,14 +71,17 @@ the socket. Bodies are JSON.
   "check_error": null,
   "checking": false,
   "restart_needed": false,
-  "auto_updates": { "enabled": true, "timezone": "America/New_York" },
-  "last_night": { "date": "2026-10-24", "summary": "Installed system 2026.10.24.0300-g1234abc. Restarted to finish." }
+  "auto_updates": { "enabled": true, "timezone": "America/New_York", "testing": false },
+  "last_night": { "date": "2026-10-24", "summary": "Installed system 0.51. Restarted to finish." }
 }
 ```
 
 - `os.install.state`: `idle`, `running` (with `percent`, `step`), `installed`
   (waiting for a restart; `restart_needed` is true), or `failed` (with `error`;
   nothing was changed).
+- `os.testing` / `app.testing`: `latest` is a test version (the owner turned on
+  test versions on the box's page). `app.check_error`: why the app's own
+  releases couldn't be checked (the system's equivalent is `check_error`).
 - `app.progress.state` and `tailscale.progress.state`: `idle`, `checking`,
   `downloading` (`version`, `percent`), `installing` (`version`), `updated`
   (`version`), `up_to_date` (`version`), or `failed` (`error`).

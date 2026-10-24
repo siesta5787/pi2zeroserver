@@ -144,6 +144,11 @@ Decided 2026-10-19. The box runs https://github.com/siesta5787/kid-phone-server
   signed `box-app.json` (tools/app-release.sh, spec in docs/examples/); boxes
   pinned to the app take new releases independently of system releases. The box
   is a generic base: see docs/box-ready-apps.md.
+- **Integration done in kid-phone-server v0.19.0** (2026-10-24): its Settings →
+  Software updates page drives the box through the box API; its own self-update,
+  apt/Tailscale/reboot actions and schedules were removed; backups restore
+  without root on a box. Its releases are signed with its own key (fingerprint
+  344a e11a 0a68 15f2 5b14, `~/box-release-keys/kid-phone-server-app-key.pem`).
 - **Layout on /data:** `app/releases/<v>/` (binary + `static/`), `app/current` →
   active release, `app/state/` (the app's `data/`: SQLite DB, backups...),
   `app/run/` working dir with `data` → `../state` and `static` → `../current/static`,

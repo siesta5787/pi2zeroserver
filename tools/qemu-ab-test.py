@@ -52,7 +52,7 @@ LOG = os.path.join(OUT, "qemu-ab-test.log")
 RAUC_KEY = os.path.join(PROJECT, "local", "rauc", "dev-key.pem")
 RAUC_CERT = os.path.join(PROJECT, "local", "rauc", "dev-cert.pem")
 # The real app, run on the emulated box (QEMU has no internet, so it's fetched here)
-APP_VERSION = "0.18.6"
+APP_VERSION = "0.19.0"
 APP_URL = ("https://github.com/siesta5787/kid-phone-server/releases/download/"
            f"v{APP_VERSION}/kid-phone-server-aarch64-unknown-linux-musl.tar.gz")
 
@@ -524,8 +524,8 @@ def check_app(con):
     check("box API reports the running app", api.get("app", {}).get("version") == APP_VERSION,
           str(api.get("app")))
 
-    stage_app(con, "0.18.7", broken=True)
-    rc, out = con.sh("/usr/libexec/box/app-activate 0.18.7", timeout=400, check=False)
+    stage_app(con, "0.19.1", broken=True)
+    rc, out = con.sh("/usr/libexec/box/app-activate 0.19.1", timeout=400, check=False)
     check("broken app release is rolled back", rc == 1, out.splitlines()[-1] if out else "")
     link = con.sh("readlink /data/app/current")[1].splitlines()[-1]
     rc, _ = con.sh("wget -q -T 10 -O /dev/null http://127.0.0.1:3100/ && test -s /data/app/state/kidphone.db",

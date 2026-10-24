@@ -167,7 +167,11 @@ images) and `docs/box-api.md` (the optional box API).
   (pins kid-phone-server v0.18.6).
 - Apps are never built here. App releases are published from the app's repo
   (`tools/app-release.sh sign`, with the app's own key); this repo's releases
-  are system-only. kid-phone-server's spec: `docs/examples/`.
+  are system-only. kid-phone-server's spec: `docs/examples/` (the live copy is
+  `box-app-spec.json` in its repo). Since v0.19.0 it uses the box API for its
+  Software updates page; sign each of its releases with
+  `~/box-release-keys/kid-phone-server-app-key.pem` (fingerprint
+  `344a e11a 0a68 15f2 5b14`), or nothing reaches the boxes.
 
 ## Things that bit us
 
