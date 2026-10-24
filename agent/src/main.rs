@@ -142,6 +142,7 @@ fn router(state: AppState, front: Front) -> Router {
         .route("/_system/factory-reset", post(factory_reset))
         .route("/_system/name", post(rename))
         .route("/_system/settings/updates", post(update_settings))
+        .route("/_system/settings/testing", post(testing_setting))
         .route("/_system/api/settings/updates", get(update_settings_state))
         .route("/_system/check", post(check_form))
         .route("/_system/os/update", post(os_update_form))
@@ -339,21 +340,30 @@ struct UpdateSettingsForm {
     #[serde(default)]
     auto: String,
     tz: String,
-    /// Checkbox: test versions early
-    #[serde(default)]
-    testing: String,
 }
 
 async fn update_settings(State(state): State<AppState>, Form(form): Form<UpdateSettingsForm>) -> Response {
-    let testing = form.testing == "on";
-    let was_testing = state.autoupdate.settings().testing;
+    let testing = state.autoupdate.settings().testing;
     match state.autoupdate.save(form.auto == "on", form.tz.trim(), testing) {
+        Ok(()) => Redirect::to("/_system/").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Html(pages::message("Not saved", &e))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TestingForm {
+    /// "on" or "off"
+    testing: String,
+}
+
+/// Test versions on/off (next to "Check now": whoever tests checks by hand)
+async fn testing_setting(State(state): State<AppState>, Form(form): Form<TestingForm>) -> Response {
+    let testing = form.testing == "on";
+    match state.autoupdate.set_testing(testing) {
         Ok(()) => {
             state.manifests.set_testing(testing);
-            if testing != was_testing {
-                // Show what's available on the new footing straight away
-                state.manifests.check_now();
-            }
+            // Show what's available on the new footing straight away
+            state.manifests.check_now();
             Redirect::to("/_system/").into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, Html(pages::message("Not saved", &e))).into_response(),
@@ -1016,7 +1026,7 @@ mod tests {
         let r = fetch(&agent, "/_system/api/settings/updates", Some(&cookie)).await;
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(v["settings"], serde_json::json!({"enabled": false, "timezone": "UTC", "testing": false}));
-        let r = submit(&agent, "/_system/settings/updates", Some(&cookie), "auto=on&tz=UTC&testing=on").await;
+        let r = submit(&agent, "/_system/settings/testing", Some(&cookie), "testing=on").await;
         assert_eq!(r.location(), "/_system/");
         let r = fetch(&agent, "/_system/api/settings/updates", Some(&cookie)).await;
         assert!(r.body.contains("\"testing\":true"), "{}", r.body);

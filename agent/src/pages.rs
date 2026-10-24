@@ -132,11 +132,6 @@ fn auto_section(u: &Updates) -> String {
              but the box doesn't know your time zone yet: choose it below so that's your night.</p>"
             .to_owned(),
     };
-    let testing = if a.testing {
-        "<p class=\"warn\">This box gets test versions early (pre-releases).</p>"
-    } else {
-        ""
-    };
     let last = u
         .last_night
         .map(|l| format!("<p class=\"muted\">Last run ({}): {}</p>", esc(&l.date), esc(&l.summary)))
@@ -159,17 +154,14 @@ fn auto_section(u: &Updates) -> String {
         ""
     };
     format!(
-        "<h3>Automatic updates</h3>{state}{testing}{last}<details{}><summary class=\"muted\">Change</summary>\
+        "<h3>Automatic updates</h3>{state}{last}<details{}><summary class=\"muted\">Change</summary>\
          <form method=\"post\" action=\"/_system/settings/updates\">\
          <p><label><input type=\"checkbox\" name=\"auto\" value=\"on\"{}> Install system and \
          Tailscale updates automatically at night</label></p>\
          <p><label>Your time zone<br><select name=\"tz\" id=\"tz\">{options}</select></label></p>\
-         <p><label><input type=\"checkbox\" name=\"testing\" value=\"on\"{}> Get test versions early \
-         (pre-releases, for trying new features; may have problems)</label></p>\
          <p><button>Save</button></p></form></details>{guess}",
         if a.timezone.is_none() { " open" } else { "" },
         if a.enabled { " checked" } else { "" },
-        if a.testing { " checked" } else { "" },
     )
 }
 
@@ -180,11 +172,37 @@ fn app_section(s: &Status, u: &Updates) -> String {
             let _ = write!(b, "<p class=\"ok\">kid-phone-server {} is running.</p>", esc(v));
         }
         Some(v) => {
-            let _ = write!(b, "<p class=\"warn\">kid-phone-server {} is installed but not running.</p>", esc(v));
+            let _ =
+                write!(b, "<p class=\"warn\">kid-phone-server {} is installed but not running.</p>", esc(v));
         }
-        None => b.push_str(
-            "<p class=\"warn\">Not installed yet. It installs by itself once the box can reach the internet.</p>",
-        ),
+        None => {
+            let release = u.manifest.latest.as_ref().and_then(|m| m.app.as_ref());
+            match (release, &u.manifest.error) {
+                (Some(app), _) if !u.app.busy() => {
+                    let _ = write!(
+                        b,
+                        "<p class=\"warn\">Not installed yet. It installs by itself in a minute or two, \
+                         or now:</p><form method=\"post\" action=\"/_system/app/update\">\
+                         <button>Install {} {}</button></form>",
+                        esc(&app.name),
+                        esc(&app.version)
+                    );
+                }
+                (Some(_), _) => b.push_str("<p class=\"warn\">Not installed yet.</p>"),
+                (None, Some(error)) => {
+                    let _ = write!(
+                        b,
+                        "<p class=\"warn\">Not installed yet: the box couldn't find out which version to \
+                         install.</p><p class=\"muted\">{}</p>",
+                        esc(error)
+                    );
+                }
+                (None, None) => b.push_str(
+                    "<p class=\"warn\">Not installed yet. It installs by itself once the box has checked \
+                     for updates (it needs the internet).</p>",
+                ),
+            }
+        }
     }
     if let Some(name) =
         s.tailscale.dns_name.as_deref().filter(|_| u.app_installed.is_some() && u.serve.configured)
@@ -258,6 +276,17 @@ fn availability(u: &Updates, running: &str) -> String {
         let _ = write!(b, "<p class=\"muted\">Couldn't check for updates: {}</p>", esc(error));
     }
     b.push_str("<form method=\"post\" action=\"/_system/check\"><button>Check now</button></form>");
+    // Whoever tries test versions checks by hand, so the switch lives here
+    let _ = write!(
+        b,
+        "<form method=\"post\" action=\"/_system/settings/testing\"><p class=\"{}\">Test versions \
+         (pre-releases): <b>{}</b> <input type=\"hidden\" name=\"testing\" value=\"{}\">\
+         <button>{}</button></p></form>",
+        if u.auto.testing { "warn" } else { "muted" },
+        if u.auto.testing { "on" } else { "off" },
+        if u.auto.testing { "off" } else { "on" },
+        if u.auto.testing { "Stop getting test versions" } else { "Get test versions early" },
+    );
     b
 }
 
@@ -823,6 +852,7 @@ mod tests {
         let failed =
             section(&Install::Idle, &Check { error: Some("offline <x>".into()), ..Default::default() });
         assert!(failed.contains("offline &lt;x&gt;") && failed.contains("Check now"));
+        assert!(failed.contains("Get test versions early"), "the switch sits by Check now");
     }
 
     #[test]
@@ -874,6 +904,7 @@ mod tests {
         assert!(!current.contains("update is available") && !current.contains("First sign-in"));
         let fresh = app_section(&status(None), &updates(None, None));
         assert!(fresh.contains("Not installed yet") && !fresh.contains("update is available"));
+        assert!(fresh.contains("Install kid-phone-server 0.19.0") && fresh.contains("/_system/app/update"));
     }
 
     #[test]

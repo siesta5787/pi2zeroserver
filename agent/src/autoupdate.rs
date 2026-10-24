@@ -165,7 +165,15 @@ impl AutoUpdate {
         if !self.valid_zone(timezone) {
             return Err(format!("Unknown time zone {timezone:?}"));
         }
-        let settings = Settings { enabled, timezone: Some(timezone.to_owned()), testing };
+        self.store(Settings { enabled, timezone: Some(timezone.to_owned()), testing })
+    }
+
+    /// Turns test versions on or off, keeping the other settings
+    pub fn set_testing(&self, testing: bool) -> Result<(), String> {
+        self.store(Settings { testing, ..self.settings() })
+    }
+
+    fn store(&self, settings: Settings) -> Result<(), String> {
         let json = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, json)
@@ -229,7 +237,8 @@ mod tests {
         assert_eq!(auto.zones(), ["UTC", "America/Indiana/Knox", "America/New_York", "Europe/Paris"]);
         assert!(auto.save(true, "Mars/Olympus", false).is_err());
         assert!(auto.save(true, "../etc", false).is_err());
-        auto.save(false, "Europe/Paris", true).unwrap();
+        auto.save(false, "Europe/Paris", false).unwrap();
+        auto.set_testing(true).unwrap();
         auto.record("2026-10-23", "Nothing new.".into());
         let reloaded = AutoUpdate::new(dir.path());
         assert_eq!(
