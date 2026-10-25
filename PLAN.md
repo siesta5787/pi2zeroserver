@@ -298,3 +298,6 @@ RPi Server DIstro/          (this folder, git)
    box-app.json (tools/app-release.sh) and update independently of the system;
    test versions via the app repo's `box-testing` pre-release.
 8. Releases: CI pipeline, Imager repo, novice guide.
+   - ✅ Novice guide: docs/setup-guide.md (flash, setup hotspot, Wi-Fi,
+     Tailscale incl. HTTPS and key expiry, choosing the app), README.md.
+     Release builds attach the card image (box-<version>.img.xz).

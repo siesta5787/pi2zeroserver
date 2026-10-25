@@ -149,7 +149,9 @@ images) and `docs/box-api.md` (the optional box API).
   and `tools/publish-release.sh` refuses those.
 - `tools/publish-release.sh [--prerelease] [--dry-run] release` publishes the current
   build's OS bundle plus a signed system `manifest.json` as a GitHub release of
-  this (public) repo. Devices poll
+  this (public) repo; release builds also attach the card image
+  `box-<version>.img.xz`, which `docs/setup-guide.md` (the novice guide) tells
+  people to flash. Never attach a dev image: it carries `local/wifi.env`. Devices poll
   `releases/latest/download/manifest.json` (+ `.sig`) a minute after boot and
   every ~12 h. Use `--dry-run` to inspect the manifest first. Afterwards, fetch
   the manifest from that URL and verify it against the image's

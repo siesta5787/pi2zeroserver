@@ -1,6 +1,7 @@
 #!/bin/bash
 # Publish a system release: the OS bundle from a build, plus a signed manifest.
-# Devices find it at
+# Release builds also attach the card image, box-<version>.img.xz, for new
+# boxes (docs/setup-guide.md links releases/latest). Devices find it at
 #   https://github.com/siesta5787/pi2zeroserver/releases/latest/download/manifest.json
 # The app isn't part of it: each box runs the app it pinned, updated from that
 # app's own releases (tools/app-release.sh, docs/box-ready-apps.md).
@@ -51,6 +52,16 @@ case "${os_version}" in *-dirty)
 		exit 1; } ;;
 esac
 tag="v${os_version}"
+# The card image to flash, for new boxes. Release builds only: a dev image
+# carries the Wi-Fi password from local/wifi.env on its data partition.
+image="" image_name="box-${os_version}.img.xz"
+if [ "${variant}" = release ]; then
+	image="${images}/sdcard.img.xz"
+	[ -f "${image}" ] || { echo "No card image at ${image}" >&2; exit 1; }
+	# post-image.sh writes it just before the bundle; an older one is from another build
+	[ $(($(stat -c %Y "${bundle}") - $(stat -c %Y "${image}"))) -le 600 ] || {
+		echo "${image} is older than the bundle: rebuild" >&2; exit 1; }
+fi
 if gh release view "${tag}" -R "${REPO}" >/dev/null 2>&1; then
 	echo "Version ${os_version} is already published: bump VERSION, commit, rebuild" >&2
 	exit 1
@@ -68,6 +79,11 @@ with open(path, "w") as f:
     json.dump(manifest, f, indent=2)
     f.write("\n")
 PY
+assets=("${bundle}" "${work}/manifest.json" "${work}/manifest.json.sig")
+if [ -n "${image}" ] && [ -z "${dry_run}" ]; then
+	cp "${image}" "${work}/${image_name}"
+	assets+=("${work}/${image_name}")
+fi
 openssl pkeyutl -sign -inkey "${key}" -rawin -in "${work}/manifest.json" -out "${work}/manifest.json.sig"
 openssl pkey -in "${key}" -pubout -out "${work}/pub.pem"
 openssl pkeyutl -verify -pubin -inkey "${work}/pub.pem" -rawin \
@@ -83,7 +99,7 @@ fi
 if [ -n "${prerelease}" ]; then
 	gh release create "${tag}" -R "${REPO}" --prerelease --title "Box ${os_version} (test version)" \
 		--notes "Test version of the system: only boxes set to get test versions early install it. OS ${os_version}" \
-		"${bundle}" "${work}/manifest.json" "${work}/manifest.json.sig"
+		"${assets[@]}"
 	# Opted-in boxes read releases/download/testing/manifest.json: point it here
 	if gh release view testing -R "${REPO}" >/dev/null 2>&1; then
 		gh release upload testing -R "${REPO}" --clobber "${work}/manifest.json" "${work}/manifest.json.sig"
@@ -95,7 +111,7 @@ if [ -n "${prerelease}" ]; then
 	echo "Published test version ${tag} (and pointed the testing manifest at it)"
 else
 	gh release create "${tag}" -R "${REPO}" --title "Box ${os_version}" \
-		--notes "System ${os_version}" \
-		"${bundle}" "${work}/manifest.json" "${work}/manifest.json.sig"
+		--notes "System ${os_version}. New box: flash ${image_name} (docs/setup-guide.md). Existing boxes update themselves." \
+		"${assets[@]}"
 	echo "Published ${tag}"
 fi
